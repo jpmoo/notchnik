@@ -8,6 +8,25 @@
 
 import Foundation
 
+extension String {
+    /// Trims whitespace, then strips one layer of balanced surrounding quotes (straight or
+    /// curly) if both ends carry them. Used to normalize model replies that come back
+    /// "wrapped in a quote" — Qwen and a couple of other models occasionally do this when
+    /// they interpret "give me a remark" as "give me a quotation."
+    func strippingSurroundingQuotes() -> String {
+        let trimmed = self.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 2 else { return trimmed }
+        let openers: Set<Character> = ["\"", "'", "\u{201C}", "\u{2018}"]
+        let closers: Set<Character> = ["\"", "'", "\u{201D}", "\u{2019}"]
+        if let first = trimmed.first, let last = trimmed.last,
+           openers.contains(first), closers.contains(last) {
+            return String(trimmed.dropFirst().dropLast())
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return trimmed
+    }
+}
+
 enum OllamaClient {
     enum ClientError: LocalizedError {
         case invalidURL

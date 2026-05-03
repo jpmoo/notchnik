@@ -359,7 +359,7 @@ final class InsightsChatStore: ObservableObject {
                 model: model,
                 history: payload
             )
-            messages.append(OllamaClient.ChatMessage(role: .assistant, content: reply))
+            messages.append(OllamaClient.ChatMessage(role: .assistant, content: reply.strippingSurroundingQuotes()))
             trimToCap()
             saveToDisk()
         } catch {

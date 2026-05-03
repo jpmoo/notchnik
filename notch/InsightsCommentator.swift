@@ -211,16 +211,16 @@ final class InsightsCommentator: ObservableObject {
             // otherwise be exactly repeating itself. Drop that sentinel; everything else lands —
             // including very short or oddly-formatted replies, since silently swallowing those
             // is what made the commentator look broken.
-            let trimmed = reply.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed == "-" {
+            let cleaned = reply.strippingSurroundingQuotes()
+            if cleaned == "-" {
                 lastTickResult = .modelSentinel
                 return
             }
-            guard !trimmed.isEmpty else {
+            guard !cleaned.isEmpty else {
                 lastTickResult = .modelEmpty
                 return
             }
-            chat.appendAssistant(reply)
+            chat.appendAssistant(cleaned)
             lastCommentAt = Date()
             lastTickResult = .fired
         } catch {

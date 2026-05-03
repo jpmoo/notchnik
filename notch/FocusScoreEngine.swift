@@ -340,8 +340,8 @@ final class FocusScoreEngine: ObservableObject {
         struct Wire: Decodable { let score: Int; let commentary: String }
         guard let wire = try? JSONDecoder().decode(Wire.self, from: data) else { return nil }
         let clamped = max(0, min(100, wire.score))
-        let trimmed = wire.commentary.trimmingCharacters(in: .whitespacesAndNewlines)
-        return ModelResult(score: clamped, commentary: trimmed.isEmpty ? "—" : trimmed)
+        let cleaned = wire.commentary.strippingSurroundingQuotes()
+        return ModelResult(score: clamped, commentary: cleaned.isEmpty ? "—" : cleaned)
     }
 
     // MARK: - Conversational categorization
@@ -425,8 +425,8 @@ final class FocusScoreEngine: ObservableObject {
             history: payload
         )
         guard let reply else { return nil }
-        let trimmed = reply.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
+        let cleaned = reply.strippingSurroundingQuotes()
+        return cleaned.isEmpty ? nil : cleaned
     }
 
     /// Watches the chat transcript. When a new user message arrives and we have a pending
@@ -551,10 +551,10 @@ final class FocusScoreEngine: ObservableObject {
                 model: settings.ollamaModel,
                 history: payload
             )
-            let trimmed = reply.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { return nil }
-            rangeInsights[key] = trimmed
-            return trimmed
+            let cleaned = reply.strippingSurroundingQuotes()
+            guard !cleaned.isEmpty else { return nil }
+            rangeInsights[key] = cleaned
+            return cleaned
         } catch {
             return nil
         }
