@@ -4,6 +4,12 @@ A macOS utility that lives in (and around) the hardware notch on MacBook Pros. H
 
 > **This codebase is entirely vibe-coded.** Written interactively with an LLM doing most of the typing across many sessions, with the human steering, vetoing, and shaping intent. There's no architectural master plan; pieces accreted as ideas came up. Treat it as such — the code style is consistent within a session and drifts across sessions, comments explain *why* things landed where they did rather than what the code is doing, and a fair amount of design rationale lives in commit-style review rather than design docs.
 
+<div align="center">
+<img width="300" alt="Clipboard" src="https://github.com/user-attachments/assets/0e13a5cd-9d18-4b16-b55d-c2f17a711424" />&nbsp;
+<img width="300" alt="AICommentary" src="https://github.com/user-attachments/assets/066e9a2d-283f-4d86-b478-a66e92dcb9c3" />&nbsp;
+<img width="300" alt="FocusScore" src="https://github.com/user-attachments/assets/2593674d-4af4-4885-b855-f20419696c25" />
+</div>
+
 ## What it does
 
 Four sections live in the panel, each toggleable in Settings:
