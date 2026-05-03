@@ -27,26 +27,10 @@ The Insights side is the largest and most opinionated piece, so a few notes:
 ## Requirements
 
 - macOS Sequoia 15+ (uses `Settings` scene + recent SwiftUI APIs).
-- A MacBook Pro with a hardware notch, ideally — though the panel still works on non-notch Macs, it just sits against the menu bar instead of around a physical cutout.
-- For Insights features: an [Ollama](https://ollama.com) instance running locally. Tested against Qwen 2.5 14B, Llama 3.1 8B, and Mistral Nemo 12B. Smaller models work but follow structural prompt directives less reliably.
+- A MacBook with a hardware notch, ideally — though the panel still works on non-notch Macs, it just sits against the menu bar instead of around a physical cutout.
+- For Insights features: an [Ollama](https://ollama.com) instance running locally or on a reachable server. Tested against Qwen 2.5 14B, Llama 3.1 8B, and Mistral Nemo 12B. Smaller models work but follow structural prompt directives less reliably.
 - For browser tab/URL capture: macOS Automation permission per browser. The Settings → Insights tab has a one-click "Authorize all running browsers" helper.
 - For activity capture: macOS Accessibility permission. Same tab.
-
-## Building from source
-
-1. Clone this repo.
-2. Open `notch.xcodeproj` in Xcode.
-3. Select the `notch` target. In Signing & Capabilities, choose your team. For local development, the personal team and "Apple Development" cert are fine.
-4. **⌘R** to run.
-
-For distribution-ready builds (notarized DMG):
-
-1. Apple Developer Program membership ($99/year) for the `Developer ID Application` cert.
-2. Product → Archive.
-3. Organizer → Distribute App → Direct Distribution → upload to Apple's notary service.
-4. After "Notarized" status, Export → ship the resulting `.app` (zipped or wrapped in a DMG).
-
-The project ships with App Sandbox + Hardened Runtime enabled. Entitlements include `network.client` (for Ollama HTTP), `files.user-selected.read-write` (for File Pen), `files.bookmarks.app-scope` (security-scoped bookmarks), `automation.apple-events` (browser tab fetching), and a `temporary-exception.apple-events` array listing the supported browser bundle IDs.
 
 ## Privacy
 
