@@ -75,4 +75,4 @@ NotchNik was built on top of:
 
 ## License
 
-MIT.
+Distributed under the [MIT License](https://mit-license.org/).
