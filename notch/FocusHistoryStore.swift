@@ -131,6 +131,9 @@ final class FocusHistoryStore: ObservableObject {
                         domainMinutes[key, default: 0] += app.minutes
                     }
                 } else {
+                    // Skip hard-ignored bundle IDs (loginwindow et al.) — they should never be
+                    // surfaced as "needs a category" or asked about.
+                    if AppSettingsStore.isIgnoredBundleID(key) { continue }
                     if settings.appCategories[key] == nil {
                         let prev = appMinutes[key]?.minutes ?? 0
                         appMinutes[key] = (name: app.appName, minutes: prev + app.minutes)
@@ -147,6 +150,26 @@ final class FocusHistoryStore: ObservableObject {
             .sorted { $0.minutes > $1.minutes }
 
         return (apps: appList, domains: domainList)
+    }
+
+    /// Removes a single entry whose `windowEnd`'s hour-of-day matches `hour` from the day file
+    /// for `date`. Used by the rescore path when the activity log no longer has anything to
+    /// score for that hour (e.g., the only events were loginwindow and got filtered out).
+    /// Silent no-op when no matching entry exists.
+    func deleteEntry(forDate date: Date, hour: Int) {
+        let key = dayKey(for: date)
+        var entries = loadEntries(forDayKey: key)
+        let originalCount = entries.count
+        entries.removeAll { calendar.component(.hour, from: $0.windowEnd) == hour }
+        guard entries.count != originalCount else { return }
+        if entries.isEmpty {
+            // Strip the now-empty day file rather than leaving a `[]` shell behind.
+            try? FileManager.default.removeItem(at: fileURL(forDayKey: key))
+            availableDayKeys.remove(key)
+        } else {
+            save(entries: entries, dayKey: key)
+        }
+        revision &+= 1
     }
 
     /// Wipes every persisted day file. Called by the "nuclear" rescore path before backfill
@@ -384,7 +407,9 @@ final class FocusHistoryStore: ObservableObject {
         // score too.
         let cleaned = stored.map { entry -> FocusScore in
             let filtered = entry.topApps.filter { row in
-                row.bundleID != "com.apple.loginwindow" && row.appName.lowercased() != "loginwindow"
+                let bundleMatches = row.bundleID?.lowercased().hasPrefix("com.apple.loginwindow") ?? false
+                let nameMatches = row.appName.lowercased().contains("loginwindow")
+                return !bundleMatches && !nameMatches
             }
             if filtered.count == entry.topApps.count { return entry }
             var copy = entry

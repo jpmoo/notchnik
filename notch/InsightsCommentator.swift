@@ -145,6 +145,12 @@ final class InsightsCommentator: ObservableObject {
             }
         }
 
+        // Force a fresh activity snapshot before composing context. Without this, the context
+        // we send describes whatever the watcher's last 30s tick saw — which can easily be a
+        // since-quit app or a since-switched window. The commentator then riffs on something
+        // the user is no longer doing.
+        activity.captureNow()
+
         let context = InsightsContextBuilder.build(activity: activity, calendar: calendar)
         // Skip if we have no useful context — a "??" comment would feel random.
         guard !context.isEmpty else {

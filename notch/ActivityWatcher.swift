@@ -165,9 +165,12 @@ final class ActivityWatcher: ObservableObject {
         decoder.dateDecodingStrategy = .iso8601
         if let stored = try? decoder.decode([Event].self, from: data) {
             // Drop any persisted `loginwindow` entries from prior versions of the watcher.
-            // The current capture path skips them entirely, but old logs may still contain
-            // them and they'd otherwise pollute focus aggregations until they aged out.
-            let cleaned = stored.filter { $0.bundleID != "com.apple.loginwindow" }
+            // Same broadened match as captureSnapshot — bundleID prefix + name contains.
+            let cleaned = stored.filter { event in
+                let bundleMatches = event.bundleID?.lowercased().hasPrefix("com.apple.loginwindow") ?? false
+                let nameMatches = event.appName.lowercased().contains("loginwindow")
+                return !bundleMatches && !nameMatches
+            }
             events = cleaned
             latestEvent = cleaned.last
             if cleaned.count != stored.count {
@@ -197,16 +200,21 @@ final class ActivityWatcher: ObservableObject {
 
     // MARK: - Capture
 
+    /// Forces an immediate snapshot, bypassing the timer cadence. Returns synchronously after
+    /// updating `events` and `latestEvent`. Used by the commentator (and other ad-hoc callers)
+    /// when they need the very latest frontmost app, not whatever the 30s tick last saw.
+    func captureNow() {
+        captureSnapshot()
+    }
+
     private func captureSnapshot() {
         guard let frontApp = NSWorkspace.shared.frontmostApplication else { return }
         let appName = frontApp.localizedName ?? "Unknown"
         let bundleID = frontApp.bundleIdentifier
-        // Ignore the lock screen / login screen entirely. macOS reports `loginwindow` as the
-        // frontmost app whenever the screen is locked, the user has switched to the login
-        // screen, or the system is at the boot prompt. None of those represent the user
-        // actually doing something — capturing them inflates idle and pollutes both the
-        // activity log and downstream focus calculations.
-        if bundleID == "com.apple.loginwindow" { return }
+        // Ignore the lock screen / login screen entirely. Match by bundleID prefix and by
+        // localized name so sub-bundle variants and unusual casing don't slip past.
+        if let id = bundleID?.lowercased(), id.hasPrefix("com.apple.loginwindow") { return }
+        if appName.lowercased().contains("loginwindow") { return }
         var windowTitle: String?
 
         if hasAccessibilityPermission {
@@ -255,16 +263,21 @@ final class ActivityWatcher: ObservableObject {
             idleSecondsAtCapture: idleSeconds
         )
 
-        // Streak handling: if the previous event matches the current observation, extend its
-        // `endTimestamp` instead of appending a duplicate. The pair (timestamp, endTimestamp)
-        // captures the whole "you stayed on this for N minutes" run. Idle gets refreshed on
-        // every tick so a streak's stored idle reflects the AFK gap at its trailing edge.
+        // Streak handling: if the previous event matches the current observation AND the time
+        // gap since its last sample is small (within a few poll intervals), extend its
+        // `endTimestamp` instead of appending a duplicate. Without the gap check, locked-screen
+        // / loginwindow stretches (which we filter out at capture, so no new events accrue
+        // during them) silently extend whichever app was frontmost before the lock — making a
+        // 9:05–10:00 AM gap look like one continuous hour of Xcode. Beyond the threshold we
+        // treat it as a fresh session even when the same app is in front.
+        let maxStreakGap = pollInterval * 4   // ~2 min by default
         if var last = events.last,
            last.appName == event.appName,
            last.bundleID == event.bundleID,
            last.windowTitle == event.windowTitle,
            last.tabURL == event.tabURL,
-           last.tabTitle == event.tabTitle {
+           last.tabTitle == event.tabTitle,
+           now.timeIntervalSince(last.endTimestamp ?? last.timestamp) <= maxStreakGap {
             last.endTimestamp = now
             last.idleSecondsAtCapture = idleSeconds
             events[events.count - 1] = last

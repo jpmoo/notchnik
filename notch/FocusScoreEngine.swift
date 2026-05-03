@@ -360,6 +360,8 @@ final class FocusScoreEngine: ObservableObject {
 
         for app in summary.appTotals {
             guard let id = app.bundleID, !id.isEmpty else { continue }
+            // Hard-ignored bundle IDs (loginwindow et al.) never get asked about.
+            if AppSettingsStore.isIgnoredBundleID(id) { continue }
             guard app.seconds >= categorizationMinSeconds else { continue }
             guard settings.appCategories[id] == nil else { continue }
             candidates.append(Candidate(
@@ -798,16 +800,22 @@ final class FocusScoreEngine: ObservableObject {
             return cal.date(byAdding: .day, value: -(max(0, daysBack) - 1), to: lastDay) ?? lastDay
         }()
 
+        // The earliest event in the (already-filtered) log defines coverage. Hours whose
+        // `windowEnd` is older than this haven't been pruned to garbage by the rescore — they
+        // genuinely predate the current log and should be left alone. Hours within coverage
+        // that have NO intersecting events are entries we should DELETE — usually because the
+        // events that produced them got filtered out (loginwindow), so the score was bogus.
+        let coverageStart = events.first?.timestamp ?? Date.distantFuture
+
         var hoursToRecompute: [(start: Date, end: Date)] = []
+        var hoursToDelete: [(date: Date, hour: Int)] = []
         var dayCursor = earliestDay
         while dayCursor <= lastDay {
             for entry in history.entries(for: dayCursor) {
                 // An entry is stale if EITHER the scoring rules have changed (loginwindow filter,
                 // threshold tweak, etc.) OR the user has updated the category map since this
-                // entry was scored. A category change can flip a previously-uninterpreted hour
-                // (Solitaire @ 90) into a properly-weighted one (Solitaire @ 30) without any
-                // change to the rules themselves. Forced re-scores bypass the staleness check
-                // so the manual button always does work even when stamps look current.
+                // entry was scored. Forced re-scores bypass the staleness check so the manual
+                // button always does work even when stamps look current.
                 if !force {
                     let entryVersion = entry.scoringVersion ?? 0
                     let entryCatRev = entry.categoriesRevision ?? 0
@@ -815,19 +823,32 @@ final class FocusScoreEngine: ObservableObject {
                         || entryCatRev < currentCategoriesRevision
                     if !stale { continue }
                 }
-                // Only re-score if the activity log still covers this hour. Otherwise we'd
-                // produce a 0-score and overwrite a real number with garbage.
                 let intersects = events.contains { event in
                     let eventEnd = event.endTimestamp ?? event.timestamp
                     return event.timestamp < entry.windowEnd && eventEnd > entry.windowStart
                 }
                 if intersects {
                     hoursToRecompute.append((start: entry.windowStart, end: entry.windowEnd))
+                } else if entry.windowEnd >= coverageStart {
+                    // Within current log coverage but no events overlap — the events that
+                    // produced this entry got filtered out (loginwindow) or otherwise removed.
+                    // Delete it. Predates-coverage entries fall through unchanged.
+                    hoursToDelete.append((date: entry.windowStart, hour: cal.component(.hour, from: entry.windowEnd)))
                 }
             }
             guard let nextDay = cal.date(byAdding: .day, value: 1, to: dayCursor) else { break }
             dayCursor = nextDay
         }
+
+        // Process deletes immediately (they're synchronous + cheap). The async Task below only
+        // runs if there's at least something to recompute.
+        for hour in hoursToDelete {
+            history.deleteEntry(forDate: hour.date, hour: hour.hour)
+        }
+        if !hoursToDelete.isEmpty {
+            rangeInsights.removeAll()
+        }
+
         guard !hoursToRecompute.isEmpty else { return }
 
         isBackfilling = true
@@ -905,9 +926,15 @@ final class FocusScoreEngine: ObservableObject {
         guard let data = try? Data(contentsOf: manifestURL) else { return }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        if let stored = try? decoder.decode(FocusScore.self, from: data) {
-            current = stored
+        guard var stored = try? decoder.decode(FocusScore.self, from: data) else { return }
+        // Cosmetic strip: pre-filter-era persisted entries may have loginwindow rows in their
+        // topApps. Match the same defensive predicate used by the summary builder.
+        stored.topApps = stored.topApps.filter { row in
+            let bundleMatches = row.bundleID?.lowercased().hasPrefix("com.apple.loginwindow") ?? false
+            let nameMatches = row.appName.lowercased().contains("loginwindow")
+            return !bundleMatches && !nameMatches
         }
+        current = stored
     }
 
     private func saveToDisk() {
@@ -989,7 +1016,23 @@ struct WindowSummary {
     /// Each event's contribution is reduced by the idle time recorded at its trailing edge so AFK
     /// stretches don't pad streaks or app totals. The wall-clock total stays available too for any
     /// caller that wants to know how much real time the window covers.
+    /// Returns true for events that should never count toward focus — currently any flavor of
+    /// `loginwindow` (lock screen, login screen, fast-user-switching). Belt-and-suspenders
+    /// against old persisted events that slipped in before we added the capture-time filter,
+    /// or future macOS variants where loginwindow ships as a sub-bundle. Case-insensitive on
+    /// both bundleID and the localized appName.
+    static func isIgnoredEvent(_ event: ActivityWatcher.Event) -> Bool {
+        if let id = event.bundleID?.lowercased(), id.hasPrefix("com.apple.loginwindow") {
+            return true
+        }
+        if event.appName.lowercased().contains("loginwindow") {
+            return true
+        }
+        return false
+    }
+
     static func build(events: [ActivityWatcher.Event], start: Date, end: Date, settings: AppSettingsStore) -> WindowSummary {
+        let events = events.filter { !isIgnoredEvent($0) }
         var activeSeconds: TimeInterval = 0
         var idleSeconds: TimeInterval = 0
         var longestStreak: TimeInterval = 0

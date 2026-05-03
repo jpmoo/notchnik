@@ -421,7 +421,10 @@ final class AppSettingsStore: ObservableObject {
 
         if let data = defaults.data(forKey: Keys.appCategories),
            let stored = try? JSONDecoder().decode([String: String].self, from: data) {
-            appCategories = stored
+            // Scrub any hard-ignored bundle IDs (loginwindow et al.) that may have been
+            // persisted by an earlier build's AI guess pass before we added the ignore list.
+            let scrubbed = stored.filter { !Self.isIgnoredBundleID($0.key) }
+            appCategories = scrubbed
         } else {
             appCategories = [:]
         }
@@ -461,10 +464,21 @@ final class AppSettingsStore: ObservableObject {
         }
     }
 
+    /// Hard-ignored bundle IDs that should never be categorized, asked about, or surfaced as
+    /// "uncategorized." Currently just any `loginwindow` flavor — the lock screen / login
+    /// screen aren't user activity in any meaningful sense, and shouldn't be assigned a
+    /// productivity category by any path (seeds, AI guess, manual, or conversational).
+    static func isIgnoredBundleID(_ bundleID: String) -> Bool {
+        let lower = bundleID.lowercased()
+        return lower.hasPrefix("com.apple.loginwindow")
+    }
+
     /// Records (or updates) a category for a given bundle ID. Empty category clears the entry.
     /// Bumps `appCategoriesRevision` only when the change is meaningful (different from current
-    /// value) so a no-op call doesn't mark every persisted score stale.
+    /// value) so a no-op call doesn't mark every persisted score stale. Refuses to set a
+    /// category on hard-ignored bundle IDs (loginwindow et al.).
     func setAppCategory(bundleID: String, category: String) {
+        if Self.isIgnoredBundleID(bundleID) { return }
         let trimmed = category.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let existing = appCategories[bundleID]
         var copy = appCategories
