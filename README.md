@@ -9,6 +9,8 @@ A macOS utility that lives in (and around) the hardware notch on MacBook Pros. H
 <img width="300" alt="AICommentary" src="https://github.com/user-attachments/assets/066e9a2d-283f-4d86-b478-a66e92dcb9c3" />&nbsp;
 <img width="300" alt="FocusScore" src="https://github.com/user-attachments/assets/2593674d-4af4-4885-b855-f20419696c25" />
 </div>
+<br>
+<div align="center"><a href="https://www.buymeacoffee.com/jpmoo" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee" style="height: 60px !important;width: 217px !important;" ></a></div>
 
 ## What it does
 
@@ -76,3 +78,5 @@ NotchNik was built on top of:
 ## License
 
 Distributed under the [MIT License](https://mit-license.org/).
+<br>
+<div align="center"><a href="https://www.buymeacoffee.com/jpmoo" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee" style="height: 60px !important;width: 217px !important;" ></a></div>
