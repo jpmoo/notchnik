@@ -1,0 +1,26 @@
+# Xcode user state — per-developer, never shared
+xcuserdata/
+*.xcuserstate
+*.xcuserdatad/
+
+# Build outputs
+build/
+DerivedData/
+*.xcarchive
+
+# macOS / Finder noise
+.DS_Store
+
+# Swift Package Manager
+.build/
+Packages/
+Package.resolved
+
+# CocoaPods (just in case)
+Pods/
+
+# fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/
+fastlane/test_output/

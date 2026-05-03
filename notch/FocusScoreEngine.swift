@@ -1,0 +1,1104 @@
+//
+//  FocusScoreEngine.swift
+//  notch
+//
+//  Hourly "focus score" computation. Each hour we look at the prior hour's activity events,
+//  derive a deterministic baseline from streak length / context-switch rate / app diversity,
+//  then ask the configured Ollama model to massage that into a 0-100 score plus a one-line
+//  commentary in the user's chosen personality voice.
+//
+//  The engine also drives conversational app categorization: when an unrecognized bundle ID
+//  shows up with significant time in a window, the engine posts a personality-voiced question
+//  into the Insights chat ("hey, what bucket should I file Linear under?"). The user replies
+//  in the same chat; on the next user turn the engine asks the model to extract a category
+//  from the reply and stores it on `AppSettingsStore.appCategories`.
+//
+
+import Combine
+import Foundation
+
+/// Snapshot of one hour-long focus measurement. Persisted so the pill survives launches.
+struct FocusScore: Codable, Equatable {
+    var value: Int             // 0...100
+    var windowStart: Date
+    var windowEnd: Date
+    var commentary: String     // AI-generated 1-2 line summary in personality voice
+    var topApps: [TopApp]      // sorted desc by minutes; cap 6
+    /// Estimated AFK minutes inside this window. Optional so older persisted entries decode
+    /// cleanly; UI treats nil as "unknown — don't render the idle underlay."
+    var idleMinutes: Int? = nil
+    /// Version of the scoring rules that produced this entry. Bumped whenever we change what
+    /// counts (loginwindow filter, idle subtraction, threshold, etc.) — entries with a stamp
+    /// older than `FocusScoreEngine.currentScoringVersion` get auto-recomputed at launch.
+    /// Optional for back-compat with pre-versioning persisted entries (treated as version 0).
+    var scoringVersion: Int? = nil
+    /// Snapshot of `AppSettingsStore.appCategoriesRevision` at scoring time. The auto-refresh
+    /// path treats a mismatch as "this entry was scored against an older category map" and
+    /// re-scores it. Lets newly-added category mappings retroactively improve old hours.
+    var categoriesRevision: Int? = nil
+
+    struct TopApp: Codable, Equatable, Hashable {
+        let appName: String
+        let bundleID: String?
+        let minutes: Int
+        /// Resolved from `settings.appCategories` at compute time. Nil = uncategorized.
+        let category: String?
+    }
+}
+
+@MainActor
+final class FocusScoreEngine: ObservableObject {
+    @Published private(set) var current: FocusScore?
+    @Published private(set) var isComputing: Bool = false
+    /// In-memory cache of AI-generated range summaries, keyed by `rangeKey + personality`. Lives
+    /// only for the session — re-launching the app drops the cache and the user can re-generate
+    /// if they care. Avoids spending tokens on a tab switch.
+    @Published private(set) var rangeInsights: [String: String] = [:]
+    /// While a range insight is generating, this holds the key being computed. UI uses it to show
+    /// a spinner on just that tab/range without globally locking.
+    @Published private(set) var generatingInsightKey: String?
+    /// What's currently waiting on a categorization reply from the user. The engine asks about
+    /// either an app (bundle ID) or a domain (host); on the next user turn it parses the
+    /// response and stores via the matching settings setter.
+    enum PendingCategorization: Equatable {
+        case app(bundleID: String, displayName: String)
+        case domain(host: String)
+
+        var displayName: String {
+            switch self {
+            case .app(_, let name): return name
+            case .domain(let host): return host
+            }
+        }
+    }
+    @Published private(set) var pendingCategorization: PendingCategorization?
+
+    private weak var chat: InsightsChatStore?
+    private weak var activity: ActivityWatcher?
+    private weak var calendar: CalendarFeedStore?
+    private weak var settings: AppSettingsStore?
+    /// Persistent journal of every successful score. Strong reference because no one else owns it.
+    let history: FocusHistoryStore
+
+    /// Hourly recompute. Each tick examines the last `windowDuration` of activity.
+    private let tickInterval: TimeInterval = 60 * 60
+    private let windowDuration: TimeInterval = 60 * 60
+    /// Bump whenever scoring rules change in a way that should invalidate older entries
+    /// (loginwindow filtering, idle accounting, the 10-min threshold, etc.). Entries persisted
+    /// with a lower stamp get auto-recomputed at launch by `autoRefreshOutdatedScores`.
+    static let currentScoringVersion: Int = 2
+    /// Apps with at least this much time in the window are eligible to be queried for a category.
+    private let categorizationMinSeconds: TimeInterval = 5 * 60
+    /// Minimum wall-clock presence (active + idle) required for an hour to be scored. Shared by
+    /// the live recompute and the backfill path so the same data produces the same outcome
+    /// regardless of how it lands in history. Stretches under this threshold are quick
+    /// check-ins, not meaningful hours of focus.
+    private let minScoredWallSeconds: TimeInterval = 10 * 60
+
+    private var timer: Timer?
+    private var cancellables = Set<AnyCancellable>()
+    /// Index of the last user message we processed. Lets us spot new user turns without
+    /// re-parsing the whole transcript on every chat-store change notification.
+    private var lastProcessedUserMessageCount: Int = 0
+
+    private static let storageFolderName = "NotchNik"
+    private static let manifestFileName = "focus_score.json"
+
+    private var manifestURL: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return base.appendingPathComponent(Self.storageFolderName, isDirectory: true)
+            .appendingPathComponent(Self.manifestFileName)
+    }
+
+    init(chat: InsightsChatStore, activity: ActivityWatcher, calendar: CalendarFeedStore, settings: AppSettingsStore, history: FocusHistoryStore? = nil) {
+        self.chat = chat
+        self.activity = activity
+        self.calendar = calendar
+        self.settings = settings
+        // Constructed inside the (MainActor-isolated) init so we don't trigger Swift 6's
+        // "default argument evaluates in nonisolated context" diagnostic.
+        self.history = history ?? FocusHistoryStore()
+        loadFromDisk()
+        // Initialize the chat-watermark to current count so we don't treat existing user turns
+        // (loaded from disk) as fresh categorization replies.
+        lastProcessedUserMessageCount = chat.messages.filter { $0.role == .user }.count
+        startTimer()
+
+        // Watch chat for new user turns to handle pending categorization replies.
+        chat.$messages
+            .sink { [weak self] msgs in
+                Task { @MainActor in self?.handleChatMessagesChanged(msgs) }
+            }
+            .store(in: &cancellables)
+    }
+
+    deinit {
+        timer?.invalidate()
+    }
+
+    // MARK: - Timer
+
+    private func startTimer() {
+        guard timer == nil else { return }
+        let timer = Timer(timeInterval: tickInterval, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in await self.recomputeNow() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+
+        // If we have no current score, or the last one is stale (older than a tick), kick off
+        // a compute now so the UI has something to show right after launch.
+        let stale = current.map { Date().timeIntervalSince($0.windowEnd) > tickInterval } ?? true
+        if stale {
+            Task { @MainActor in
+                await self.recomputeNow()
+                // After the live compute, fill in any historic hours that have activity but
+                // never got a score (machine was asleep when the timer would have fired, app
+                // was quit, etc.).
+                self.backfillMissingHours()
+            }
+        } else {
+            Task { @MainActor in self.backfillMissingHours() }
+        }
+        // `autoRefreshOutdatedScores` is NOT called on launch — NotchNik is meant to stay
+        // running, so launch happens rarely and a startup refresh would either rarely fire
+        // (most users) or do nothing (always-running users). Instead it's triggered when the
+        // user opens the focus-score panel; see `FocusScoreDetailPresenter.toggle`.
+    }
+
+    // MARK: - Recompute
+
+    /// Builds the per-window summary, derives a baseline score, asks the model to refine it
+    /// into a score + voice-matched commentary, and stores the result. Also queues a
+    /// categorization question if any apps in the window are uncategorized.
+    func recomputeNow() async {
+        guard let activity, let settings else { return }
+        guard !isComputing else { return }
+        isComputing = true
+        defer { isComputing = false }
+
+        let now = Date()
+        let windowStart = now.addingTimeInterval(-windowDuration)
+        let summary = WindowSummary.build(events: activity.events, start: windowStart, end: now, settings: settings)
+
+        // Skip empty / quick-check-in hours: same threshold backfill uses. A 5-min stretch
+        // isn't a meaningful "hour of focus" no matter what happened in it.
+        let wallSeconds = summary.totalSeconds + summary.idleSeconds
+        guard wallSeconds >= minScoredWallSeconds else { return }
+
+        // Always compute a deterministic baseline so we have something even if Ollama is down.
+        let baseline = baselineScore(from: summary)
+
+        var finalScore = baseline
+        var commentary = defaultCommentary(for: summary, score: baseline)
+
+        let calendarContext = calendar.map { CalendarSummaryFormatter.describe(events: $0.events, windowStart: windowStart, windowEnd: now) } ?? ""
+
+        if !settings.ollamaModel.isEmpty {
+            if let modelResult = await askModelForScore(summary: summary, baseline: baseline, calendarContext: calendarContext, settings: settings) {
+                finalScore = modelResult.score
+                commentary = modelResult.commentary
+            }
+        }
+
+        let score = FocusScore(
+            value: finalScore,
+            windowStart: windowStart,
+            windowEnd: now,
+            commentary: commentary,
+            topApps: summary.topApps(in: settings),
+            idleMinutes: Int(summary.idleSeconds / 60),
+            scoringVersion: Self.currentScoringVersion,
+            categoriesRevision: settings.appCategoriesRevision
+        )
+        current = score
+        saveToDisk()
+        history.record(score)
+        // Backfill in the same pass so gaps that have accumulated (machine asleep, app quit, etc.)
+        // get filled in alongside the live compute. Cheap — deterministic baseline only.
+        backfillMissingHours()
+        // Any cached range insight is now stale — its summary was computed against a smaller
+        // entry set. Clearing forces a fresh generation next time the user opens the panel and
+        // clicks "Generate insight."
+        rangeInsights.removeAll()
+
+        // After scoring, see if we have an unrecognized app worth asking about. Only do this
+        // when the user isn't already mid-conversation (don't barge into a thread) and we
+        // aren't already waiting on a previous question.
+        await maybeAskAboutUncategorizedApp(summary: summary, settings: settings)
+    }
+
+    // MARK: - Baseline scoring
+
+    /// Cheap, deterministic score from streak/switch/diversity stats. Range 0-100. The model
+    /// usually nudges this; if Ollama is unavailable we ship the baseline as-is.
+    private func baselineScore(from summary: WindowSummary) -> Int {
+        guard summary.totalSeconds > 0 else { return 0 }
+        // Longest streak as a fraction of the window — capped so a single long streak in a
+        // partial window doesn't blow past 1.0.
+        let streakFraction = min(1.0, summary.longestStreakSeconds / max(60, summary.totalSeconds))
+        // Switches per minute → penalty curve. 0 switches = full credit, ≥6/min = full penalty.
+        let switchesPerMin = Double(summary.switches) / max(1, summary.totalSeconds / 60)
+        let switchPenalty = min(1.0, switchesPerMin / 6.0)
+        // Distinct contexts. 1-2 = focused, 6+ = scattered.
+        let diversityPenalty = min(1.0, max(0, Double(summary.distinctContexts - 2)) / 6.0)
+
+        let raw = 0.6 * streakFraction + 0.4 * (1 - 0.6 * switchPenalty - 0.4 * diversityPenalty)
+        return Int((max(0, min(1, raw)) * 100).rounded())
+    }
+
+    private func defaultCommentary(for summary: WindowSummary, score: Int) -> String {
+        if summary.totalSeconds < 60 {
+            return "Not much logged in the last hour."
+        }
+        let top = summary.appTotals.first
+        if let top {
+            let mins = Int(top.seconds / 60)
+            return "Mostly \(top.appName) (\(mins) min) with \(summary.switches) context switches."
+        }
+        return "\(summary.switches) switches across \(summary.distinctContexts) contexts."
+    }
+
+    // MARK: - Ollama refinement
+
+    private struct ModelResult { let score: Int; let commentary: String }
+
+    private func askModelForScore(summary: WindowSummary, baseline: Int, calendarContext: String, settings: AppSettingsStore) async -> ModelResult? {
+        // Use the post-substitution top-entries list so browser time appears as per-domain
+        // rows (gmail.com, theonion.com, etc.) instead of one undifferentiated Chrome bucket.
+        // Each row already has its category resolved (host → app fallback → uncategorized).
+        let appsBlock = summary.topApps(in: settings).map { row -> String in
+            let cat = row.category ?? "uncategorized"
+            return "- \(row.appName) (\(row.minutes) min, \(cat))"
+        }.joined(separator: "\n")
+
+        let activeMin = Int(summary.totalSeconds / 60)
+        let idleMin = Int(summary.idleSeconds / 60)
+        let userPrompt = """
+        Compute a focus score for the last hour of the user's desktop activity.
+
+        Stats:
+        - Longest unbroken active streak in one app/window: \(Int(summary.longestStreakSeconds / 60)) min
+        - Total context switches: \(summary.switches)
+        - Distinct contexts (app+window+tab): \(summary.distinctContexts)
+        - Active time (idle subtracted): \(activeMin) min
+        - Idle time (AFK — no input): \(idleMin) min
+        - Heuristic baseline score (0-100): \(baseline)
+
+        Top apps used:
+        \(appsBlock.isEmpty ? "(none)" : appsBlock)
+
+        Calendar during this window:
+        \(calendarContext.isEmpty ? "(no events on calendar)" : calendarContext)
+
+        If significant idle time overlaps a calendar event in the context above, treat it as the \
+        user being in that meeting rather than slacking. Adjust the score upward in that case and \
+        say so in the commentary. Idle time outside of meetings is a focus negative.
+
+        Weight the KIND of time, not just the depth. The streak/switch numbers can look pristine \
+        for activities that aren't focused work — an uninterrupted hour of solitaire, doomscrolling, \
+        or YouTube watch parties is not a 90. If the top apps' categories are dominated by social, \
+        entertainment, games, or other low-engagement uses, the score should reflect that the user \
+        wasn't doing meaningful work even if the behavioral metrics look clean. Conversely, hours \
+        dominated by categories like coding, writing, design, research, or comms should keep their \
+        high baseline when behavior also looks focused. When categories are missing or "uncategorized" \
+        for most apps, fall back to the baseline; don't guess.
+
+        Respond with ONLY a JSON object on a single line, no prose, no code fences:
+        {"score": <0-100 integer>, "commentary": "<one or two short sentences in your voice>"}
+
+        The commentary must be under 240 characters, in the personality voice you've been given, \
+        and grounded in the stats above. Don't invent activities not listed. Don't recycle phrasing \
+        from your previous turns.
+        """
+
+        let system = buildInsightsSystemPrompt(personality: settings.insightsPersonality)
+        let payload: [OllamaClient.ChatMessage] = [
+            OllamaClient.ChatMessage(role: .system, content: system),
+            OllamaClient.ChatMessage(role: .user, content: userPrompt)
+        ]
+
+        do {
+            let reply = try await OllamaClient.chat(
+                baseURL: settings.ollamaURL,
+                model: settings.ollamaModel,
+                history: payload,
+                options: .deterministicJSON()
+            )
+            return parseScoreJSON(reply)
+        } catch {
+            return nil
+        }
+    }
+
+    /// Lenient JSON extractor — tolerates surrounding prose by scanning for the first `{...}`.
+    private func parseScoreJSON(_ raw: String) -> ModelResult? {
+        guard let start = raw.firstIndex(of: "{"), let end = raw.lastIndex(of: "}"), start < end else { return nil }
+        let json = String(raw[start...end])
+        guard let data = json.data(using: .utf8) else { return nil }
+        struct Wire: Decodable { let score: Int; let commentary: String }
+        guard let wire = try? JSONDecoder().decode(Wire.self, from: data) else { return nil }
+        let clamped = max(0, min(100, wire.score))
+        let trimmed = wire.commentary.trimmingCharacters(in: .whitespacesAndNewlines)
+        return ModelResult(score: clamped, commentary: trimmed.isEmpty ? "—" : trimmed)
+    }
+
+    // MARK: - Conversational categorization
+
+    /// Find the biggest uncategorized app or domain in the window and ask the user about it
+    /// (in personality voice) via a chat assistant message. Apps and domains compete on time;
+    /// whichever has the most uncategorized minutes wins. The user's next turn gets parsed by
+    /// `handleChatMessagesChanged`.
+    private func maybeAskAboutUncategorizedApp(summary: WindowSummary, settings: AppSettingsStore) async {
+        guard pendingCategorization == nil, let chat else { return }
+
+        // Build the union of candidates: uncategorized apps + uncategorized domains, all
+        // above the time threshold. Whichever has the most time wins the slot.
+        struct Candidate { let kind: PendingCategorization; let seconds: TimeInterval; let label: String }
+        var candidates: [Candidate] = []
+
+        for app in summary.appTotals {
+            guard let id = app.bundleID, !id.isEmpty else { continue }
+            guard app.seconds >= categorizationMinSeconds else { continue }
+            guard settings.appCategories[id] == nil else { continue }
+            candidates.append(Candidate(
+                kind: .app(bundleID: id, displayName: app.appName),
+                seconds: app.seconds,
+                label: app.appName
+            ))
+        }
+        for host in summary.hostTotals {
+            guard host.seconds >= categorizationMinSeconds else { continue }
+            guard settings.domainCategories[host.host] == nil else { continue }
+            candidates.append(Candidate(
+                kind: .domain(host: host.host),
+                seconds: host.seconds,
+                label: host.host
+            ))
+        }
+        guard let pick = candidates.max(by: { $0.seconds < $1.seconds }) else { return }
+
+        // Ask the model to phrase the question in personality voice. Fall back to a plain
+        // phrasing if the call fails so we still seed the conversation.
+        let phrased = await phraseCategorizationQuestion(label: pick.label, kind: pick.kind, settings: settings)
+            ?? defaultCategorizationQuestion(label: pick.label, kind: pick.kind)
+
+        pendingCategorization = pick.kind
+        // Mark the watermark as the *current* user-message count so this assistant message
+        // doesn't get matched against a stale previous user reply.
+        lastProcessedUserMessageCount = chat.messages.filter { $0.role == .user }.count
+        chat.appendAssistant(phrased)
+    }
+
+    private func defaultCategorizationQuestion(label: String, kind: PendingCategorization) -> String {
+        switch kind {
+        case .app:
+            return "What category should I put \(label) under? (e.g. coding, comms, research, social…)"
+        case .domain:
+            return "What category should I put \(label) under? (e.g. comms, research, social, entertainment…)"
+        }
+    }
+
+    private func phraseCategorizationQuestion(label: String, kind: PendingCategorization, settings: AppSettingsStore) async -> String? {
+        guard !settings.ollamaModel.isEmpty else { return nil }
+        let system = buildInsightsSystemPrompt(personality: settings.insightsPersonality)
+        let kindDescription: String
+        switch kind {
+        case .app: kindDescription = "the app"
+        case .domain: kindDescription = "the website / domain"
+        }
+        let userPrompt = """
+        Ask the user, in one short sentence in your voice, what category they'd file \(kindDescription) \
+        "\(label)" under. Mention a couple example buckets like coding, comms, research, design, \
+        social, entertainment, admin, writing. No greeting, no preface. Just the question.
+        """
+        let payload: [OllamaClient.ChatMessage] = [
+            OllamaClient.ChatMessage(role: .system, content: system),
+            OllamaClient.ChatMessage(role: .user, content: userPrompt)
+        ]
+        let reply = try? await OllamaClient.chat(
+            baseURL: settings.ollamaURL,
+            model: settings.ollamaModel,
+            history: payload
+        )
+        guard let reply else { return nil }
+        let trimmed = reply.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// Watches the chat transcript. When a new user message arrives and we have a pending
+    /// categorization, ask the model to extract a category from the user's reply and store
+    /// it via the right setter (app vs. domain).
+    private func handleChatMessagesChanged(_ messages: [OllamaClient.ChatMessage]) {
+        let userTurns = messages.filter { $0.role == .user }
+        guard userTurns.count > lastProcessedUserMessageCount else { return }
+        defer { lastProcessedUserMessageCount = userTurns.count }
+        guard let pending = pendingCategorization,
+              let settings,
+              let latest = userTurns.last else { return }
+
+        Task { @MainActor in
+            if let category = await extractCategory(fromReply: latest.content, label: pending.displayName, settings: settings) {
+                switch pending {
+                case .app(let bundleID, _):
+                    settings.setAppCategory(bundleID: bundleID, category: category)
+                case .domain(let host):
+                    settings.setDomainCategory(host: host, category: category)
+                }
+            }
+            // Whether or not we extracted a category, drop the pending state. The user can
+            // always edit categories in Settings if our parse missed.
+            pendingCategorization = nil
+        }
+    }
+
+    private func extractCategory(fromReply reply: String, label: String, settings: AppSettingsStore) async -> String? {
+        guard !settings.ollamaModel.isEmpty else { return nil }
+        let userPrompt = """
+        I asked the user what category to file "\(label)" under. They replied:
+
+        "\(reply)"
+
+        Extract just the category they're assigning. Respond with ONLY the category name as 1-3 \
+        lowercase words (e.g. "coding", "comms", "personal admin"), or the single character "?" if \
+        their reply doesn't actually pick a category. No quotes, no punctuation, no explanation.
+        """
+        let payload: [OllamaClient.ChatMessage] = [
+            // Use a neutral system prompt for the parse — we want a clean extraction, not a
+            // personality-voiced reply.
+            OllamaClient.ChatMessage(role: .system, content: "You are a precise text extractor. Follow the user's format instructions exactly."),
+            OllamaClient.ChatMessage(role: .user, content: userPrompt)
+        ]
+        let raw = try? await OllamaClient.chat(
+            baseURL: settings.ollamaURL,
+            model: settings.ollamaModel,
+            history: payload,
+            options: .deterministicJSON()
+        )
+        guard let raw else { return nil }
+        let cleaned = raw
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "\".,!?"))
+            .lowercased()
+        if cleaned.isEmpty || cleaned == "?" { return nil }
+        // Sanity bound: refuse anything longer than 4 words — likely the model rambled.
+        let words = cleaned.split(separator: " ")
+        if words.count > 4 { return nil }
+        return cleaned
+    }
+
+    // MARK: - Range insights
+
+    /// Build a cache key for a (rangeLabel, personality) pair.
+    ///
+    /// We deliberately do NOT include the range's start/end dates in the key. Rolling ranges like
+    /// "Today" or "This week" recompute their `end` from `Date()` on every SwiftUI re-render, so
+    /// including the exact instants meant the writer's key (set at click time) never matched the
+    /// reader's key (computed milliseconds later) — `cachedSummary` always returned nil and the
+    /// "Generate insight" button appeared to do nothing. The label + personality uniquely
+    /// identifies the cache slot within a session.
+    private static func rangeKey(rangeLabel: String, personality: InsightsPersonality) -> String {
+        "\(rangeLabel)|\(personality.rawValue)"
+    }
+
+    /// Returns a cached AI summary for a range if one exists; otherwise nil.
+    func cachedInsight(rangeLabel: String, range: DateInterval) -> String? {
+        guard let settings else { return nil }
+        let key = Self.rangeKey(rangeLabel: rangeLabel, personality: settings.insightsPersonality)
+        return rangeInsights[key]
+    }
+
+    /// Generates a personality-voiced summary of the supplied stats and caches it. Caller
+    /// supplies the human-readable range label ("This week", "Last month", etc.) which we both
+    /// fold into the prompt and use as part of the cache key. Returns the generated text on
+    /// success, nil on any error or empty model.
+    @discardableResult
+    func generateRangeInsight(rangeLabel: String, stats: RangeStats) async -> String? {
+        guard let settings, !settings.ollamaModel.isEmpty else { return nil }
+        let key = Self.rangeKey(rangeLabel: rangeLabel, personality: settings.insightsPersonality)
+        if let cached = rangeInsights[key] { return cached }
+        if generatingInsightKey == key { return nil }   // already in flight
+
+        generatingInsightKey = key
+        defer { generatingInsightKey = nil }
+
+        let digest = Self.formatDigest(rangeLabel: rangeLabel, stats: stats)
+        let userPrompt = """
+        You are summarizing the user's focus-score history for a range. Below is an aggregated \
+        digest — these numbers are the only ground truth; do not invent activities not listed.
+
+        \(digest)
+
+        Write a short summary (3–5 sentences, under 320 characters) in your personality voice. \
+        Cover: overall trend (high / mixed / low), one observation about peaks (when they focus \
+        best), one about troughs (when they don't), and at most one suggestion. If a category \
+        dominates time, mention it. Don't list raw numbers verbatim — interpret them. Don't open \
+        with a greeting. Don't recycle phrases from your previous turns.
+        """
+
+        let system = buildInsightsSystemPrompt(personality: settings.insightsPersonality)
+        let payload: [OllamaClient.ChatMessage] = [
+            OllamaClient.ChatMessage(role: .system, content: system),
+            OllamaClient.ChatMessage(role: .user, content: userPrompt)
+        ]
+
+        do {
+            let reply = try await OllamaClient.chat(
+                baseURL: settings.ollamaURL,
+                model: settings.ollamaModel,
+                history: payload
+            )
+            let trimmed = reply.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            rangeInsights[key] = trimmed
+            return trimmed
+        } catch {
+            return nil
+        }
+    }
+
+    /// Invalidate any cached insight for a particular range (e.g. when the user clicks Refresh).
+    func invalidateInsight(rangeLabel: String, range: DateInterval) {
+        guard let settings else { return }
+        let key = Self.rangeKey(rangeLabel: rangeLabel, personality: settings.insightsPersonality)
+        rangeInsights.removeValue(forKey: key)
+    }
+
+    // MARK: - Backfill
+
+    /// True while a backfill pass is in flight. Used to suppress redundant calls when the user
+    /// triggers another recompute in the middle of an already-running backfill.
+    @Published private(set) var isBackfilling: Bool = false
+
+    /// Walks the activity log and fills focus-history gaps for any hour with activity but no
+    /// score. Each backfilled hour gets the same AI commentary path as the live compute — the
+    /// goal is parity with current-hour entries, not "deterministic placeholders." Throttled to
+    /// one model call at a time and run as an unstructured Task so it doesn't block the UI.
+    /// Calendar context overlapping each hour is included so e.g. an idle hour during a meeting
+    /// is interpreted correctly.
+    func backfillMissingHours(daysBack: Int = 3) {
+        guard !isBackfilling else { return }
+        // Same pattern as `autoRefreshOutdatedScores`: precondition-check `settings` for
+        // non-nil but don't bind it; the inner Task re-fetches `self.settings`.
+        guard let activity, settings != nil else { return }
+        let events = activity.events
+        guard !events.isEmpty else { return }
+
+        // Identify candidate hours up front so the long-running task doesn't have to re-scan
+        // the events array on every iteration.
+        let cal = Calendar.current
+        let now = Date()
+        let earliestAllowed = cal.date(byAdding: .day, value: -daysBack, to: now) ?? now
+        guard let firstInRange = events.first(where: { $0.timestamp >= earliestAllowed }) else { return }
+        let scanStart = max(firstInRange.timestamp, earliestAllowed)
+        var cursor = cal.date(bySettingHour: cal.component(.hour, from: scanStart), minute: 0, second: 0, of: scanStart) ?? scanStart
+        let currentHourStart = cal.date(bySettingHour: cal.component(.hour, from: now), minute: 0, second: 0, of: now) ?? now
+
+        var hoursToBackfill: [(start: Date, end: Date)] = []
+        while cursor < currentHourStart {
+            guard let nextHour = cal.date(byAdding: .hour, value: 1, to: cursor) else { break }
+            let existing = history.entries(for: cursor)
+            let hourOfWindowEnd = cal.component(.hour, from: nextHour)
+            let alreadyScored = existing.contains { cal.component(.hour, from: $0.windowEnd) == hourOfWindowEnd }
+            if !alreadyScored {
+                let intersects = events.contains { event in
+                    let eventEnd = event.endTimestamp ?? event.timestamp
+                    return event.timestamp < nextHour && eventEnd > cursor
+                }
+                if intersects {
+                    hoursToBackfill.append((start: cursor, end: nextHour))
+                }
+            }
+            cursor = nextHour
+        }
+        guard !hoursToBackfill.isEmpty else { return }
+
+        isBackfilling = true
+        // Newest-first so the user sees recent gaps fill in quickly when they open the chart.
+        hoursToBackfill.reverse()
+
+        Task { @MainActor [weak self] in
+            // Hoist the strong-ref unwrap to the top of the task so it's valid for the whole
+            // body — including the post-loop `rangeInsights.removeAll()` and the defer.
+            guard let self else { return }
+            defer { self.isBackfilling = false }
+            for window in hoursToBackfill {
+                guard let activity = self.activity, let settings = self.settings else { return }
+                let summary = WindowSummary.build(events: activity.events, start: window.start, end: window.end, settings: settings)
+                // Same threshold the live path uses; see `minScoredWallSeconds` declaration.
+                let wallSeconds = summary.totalSeconds + summary.idleSeconds
+                guard wallSeconds >= self.minScoredWallSeconds else { continue }
+                let baseline = self.baselineScore(from: summary)
+                var finalScore = baseline
+                var commentary = self.defaultCommentary(for: summary, score: baseline)
+
+                // Use AI just like the live path. If the model errors or is unconfigured we
+                // still record the deterministic baseline — partial backfill beats nothing.
+                if !settings.ollamaModel.isEmpty {
+                    if let result = await self.askModelForScore(summary: summary, baseline: baseline, calendarContext: self.calendarContextSnippet(for: window), settings: settings) {
+                        finalScore = result.score
+                        commentary = result.commentary
+                    }
+                }
+
+                let score = FocusScore(
+                    value: finalScore,
+                    windowStart: window.start,
+                    windowEnd: window.end,
+                    commentary: commentary,
+                    topApps: summary.topApps(in: settings),
+                    idleMinutes: Int(summary.idleSeconds / 60),
+                    scoringVersion: Self.currentScoringVersion
+                )
+                self.history.record(score)
+            }
+            // Cached range insights computed mid-backfill are now stale.
+            self.rangeInsights.removeAll()
+        }
+    }
+
+    /// Calendar events overlapping a single hour, formatted the same way `recomputeNow` does
+    /// so backfill prompts share a shape with live ones.
+    private func calendarContextSnippet(for window: (start: Date, end: Date)) -> String {
+        guard let calendar else { return "" }
+        return CalendarSummaryFormatter.describe(events: calendar.events, windowStart: window.start, windowEnd: window.end)
+    }
+
+    /// Ask the model to take a guess at categorizing apps/domains that have shown up with
+    /// significant time but aren't categorized yet. One batched JSON call covers everything,
+    /// keeping token cost low. Skipped silently when no model is configured. Applied entries
+    /// are stored just like any user-set category — the user can correct in Settings if a
+    /// guess is wrong, and the score auto-refresh will re-rate affected hours.
+    ///
+    /// This sits between the seed table (hardcoded common apps) and the conversational asker
+    /// (stops the bot from quizzing the user about every long-tail app). After this runs,
+    /// only genuinely ambiguous apps should remain uncategorized.
+    @discardableResult
+    func aiCategorizeUncategorized(daysBack: Int = 14) async -> Int {
+        guard let settings, !settings.ollamaModel.isEmpty else { return 0 }
+        let uncategorized = history.uncategorizedItems(daysBack: daysBack, settings: settings)
+        let appCount = uncategorized.apps.count
+        let domainCount = uncategorized.domains.count
+        guard appCount + domainCount > 0 else { return 0 }
+
+        // Build a single prompt listing both apps and domains so the model can answer in one
+        // shot. Cap to top 20 of each to keep the prompt bounded.
+        let appLines = uncategorized.apps.prefix(20).map { "- app: \"\($0.name)\" (bundle: \($0.bundleID))" }
+        let domainLines = uncategorized.domains.prefix(20).map { "- domain: \"\($0.host)\"" }
+        let listing = (appLines + domainLines).joined(separator: "\n")
+
+        let userPrompt = """
+        Categorize these apps and websites. Use these category buckets ONLY:
+        coding, writing, design, comms, research, admin, social, entertainment, games
+
+        For each item, decide which bucket fits its primary use. If you genuinely don't recognize \
+        something or it's too ambiguous to guess, OMIT it from the response (don't guess wildly).
+
+        Items to categorize:
+        \(listing)
+
+        Respond with ONLY a JSON object on a single line, no prose, no code fences:
+        {"apps": {"<bundle-id>": "<category>", ...}, "domains": {"<host>": "<category>", ...}}
+
+        Use the bundle IDs and hosts EXACTLY as provided as JSON keys. Categories must be one \
+        of the buckets listed above, lowercase, no extra punctuation.
+        """
+
+        let payload: [OllamaClient.ChatMessage] = [
+            OllamaClient.ChatMessage(role: .system, content: "You are a precise text extractor and classifier. Follow the user's format instructions exactly."),
+            OllamaClient.ChatMessage(role: .user, content: userPrompt)
+        ]
+
+        let raw: String
+        do {
+            raw = try await OllamaClient.chat(
+                baseURL: settings.ollamaURL,
+                model: settings.ollamaModel,
+                history: payload,
+                options: .deterministicJSON()
+            )
+        } catch {
+            return 0
+        }
+
+        guard let start = raw.firstIndex(of: "{"), let end = raw.lastIndex(of: "}"), start < end else { return 0 }
+        let json = String(raw[start...end])
+        guard let data = json.data(using: .utf8) else { return 0 }
+        struct Wire: Decodable { let apps: [String: String]?; let domains: [String: String]? }
+        guard let wire = try? JSONDecoder().decode(Wire.self, from: data) else { return 0 }
+
+        // Whitelist categories we accept; the prompt asks for these but we sanitize defensively
+        // so a model that improvises ("productivity") doesn't pollute the store.
+        let allowed: Set<String> = ["coding", "writing", "design", "comms", "research", "admin", "social", "entertainment", "games"]
+
+        var applied = 0
+        for (bundleID, category) in wire.apps ?? [:] {
+            let cat = category.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard allowed.contains(cat) else { continue }
+            // Don't overwrite a category the user (or seed) has already set.
+            guard settings.appCategories[bundleID] == nil else { continue }
+            settings.setAppCategory(bundleID: bundleID, category: cat)
+            applied += 1
+        }
+        for (host, category) in wire.domains ?? [:] {
+            let cat = category.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard allowed.contains(cat) else { continue }
+            guard settings.domainCategories[host.lowercased()] == nil else { continue }
+            settings.setDomainCategory(host: host, category: cat)
+            applied += 1
+        }
+
+        return applied
+    }
+
+    /// Nuclear option: wipe every persisted score, then recreate everything the activity log
+    /// can still cover via the backfill path. Useful when scoring rules have shifted enough
+    /// that incremental refresh feels inadequate, or as a manual reset. Slow on large logs —
+    /// every hour with ≥10 min of activity will trigger a model call. Background-Task'd; UI
+    /// stays responsive.
+    func nukeAndRecomputeAllScores() {
+        guard !isBackfilling else { return }
+        history.deleteAllEntries()
+        current = nil
+        rangeInsights.removeAll()
+        // Backfill walks the activity log and recreates every eligible hour. With history now
+        // empty, every hour is "missing" and gets scored fresh under the current rules and
+        // category map.
+        backfillMissingHours(daysBack: 365)
+    }
+
+    /// Re-score persisted entries within the recent past (default: today + yesterday). When
+    /// `force` is false (the auto-on-pill-click path), only entries with stale stamps get
+    /// re-scored; otherwise all eligible entries get the full treatment regardless. The
+    /// manual "Re-score history" button passes `force: true` so it actually does work even
+    /// when stamps look current — useful when the activity log has been cleaned up
+    /// out-of-band (e.g., loginwindow filtering after the fact).
+    ///
+    /// Sequential, background-Task'd, AI-refined just like backfill. Skips hours where the
+    /// activity log no longer covers them (pruned by retention) — those entries stay as-is
+    /// rather than getting wiped to zero.
+    func autoRefreshOutdatedScores(daysBack: Int = 2, force: Bool = false) {
+        guard !isBackfilling else { return }
+        guard let activity, let settings else { return }
+        let currentCategoriesRevision = settings.appCategoriesRevision
+        let events = activity.events
+        guard !events.isEmpty else { return }
+        let cal = Calendar.current
+
+        let now = Date()
+        let lastDay = cal.startOfDay(for: now)
+        // Window the scan to the last `daysBack` days. Default 2 = today + yesterday. Pass a
+        // very large value (e.g. `Int.max`) to mean "as far back as the activity log covers" —
+        // we clamp to the earliest event so `cal.date(byAdding:)` doesn't overflow.
+        let earliestDay: Date = {
+            if daysBack >= 365, let earliestEvent = events.first?.timestamp {
+                return cal.startOfDay(for: earliestEvent)
+            }
+            return cal.date(byAdding: .day, value: -(max(0, daysBack) - 1), to: lastDay) ?? lastDay
+        }()
+
+        var hoursToRecompute: [(start: Date, end: Date)] = []
+        var dayCursor = earliestDay
+        while dayCursor <= lastDay {
+            for entry in history.entries(for: dayCursor) {
+                // An entry is stale if EITHER the scoring rules have changed (loginwindow filter,
+                // threshold tweak, etc.) OR the user has updated the category map since this
+                // entry was scored. A category change can flip a previously-uninterpreted hour
+                // (Solitaire @ 90) into a properly-weighted one (Solitaire @ 30) without any
+                // change to the rules themselves. Forced re-scores bypass the staleness check
+                // so the manual button always does work even when stamps look current.
+                if !force {
+                    let entryVersion = entry.scoringVersion ?? 0
+                    let entryCatRev = entry.categoriesRevision ?? 0
+                    let stale = entryVersion < Self.currentScoringVersion
+                        || entryCatRev < currentCategoriesRevision
+                    if !stale { continue }
+                }
+                // Only re-score if the activity log still covers this hour. Otherwise we'd
+                // produce a 0-score and overwrite a real number with garbage.
+                let intersects = events.contains { event in
+                    let eventEnd = event.endTimestamp ?? event.timestamp
+                    return event.timestamp < entry.windowEnd && eventEnd > entry.windowStart
+                }
+                if intersects {
+                    hoursToRecompute.append((start: entry.windowStart, end: entry.windowEnd))
+                }
+            }
+            guard let nextDay = cal.date(byAdding: .day, value: 1, to: dayCursor) else { break }
+            dayCursor = nextDay
+        }
+        guard !hoursToRecompute.isEmpty else { return }
+
+        isBackfilling = true
+        // Newest-first so the user sees the most recent corrections land first.
+        hoursToRecompute.reverse()
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.isBackfilling = false }
+            for window in hoursToRecompute {
+                guard let activity = self.activity, let settings = self.settings else { return }
+                let summary = WindowSummary.build(events: activity.events, start: window.start, end: window.end, settings: settings)
+                // If the cleaned log no longer has 60+ active seconds in this hour, the entry
+                // is no longer meaningful — drop it rather than rewriting to 0.
+                guard summary.totalSeconds >= 60 else { continue }
+                let baseline = self.baselineScore(from: summary)
+                var finalScore = baseline
+                var commentary = self.defaultCommentary(for: summary, score: baseline)
+                if !settings.ollamaModel.isEmpty {
+                    if let result = await self.askModelForScore(summary: summary, baseline: baseline, calendarContext: self.calendarContextSnippet(for: window), settings: settings) {
+                        finalScore = result.score
+                        commentary = result.commentary
+                    }
+                }
+                let score = FocusScore(
+                    value: finalScore,
+                    windowStart: window.start,
+                    windowEnd: window.end,
+                    commentary: commentary,
+                    topApps: summary.topApps(in: settings),
+                    idleMinutes: Int(summary.idleSeconds / 60),
+                    scoringVersion: Self.currentScoringVersion
+                )
+                self.history.record(score)
+            }
+            self.rangeInsights.removeAll()
+        }
+    }
+
+    /// Renders the stats payload as a compact text block the model can read. Uses local-time
+    /// formatting and clamps lists so the prompt stays well under any reasonable token budget.
+    private static func formatDigest(rangeLabel: String, stats: RangeStats) -> String {
+        var lines: [String] = []
+        lines.append("Range: \(rangeLabel) (\(stats.dayCount) day\(stats.dayCount == 1 ? "" : "s"), \(stats.entryCount) hourly score\(stats.entryCount == 1 ? "" : "s"))")
+        lines.append("Average focus score: \(stats.averageScore)/100")
+        lines.append("Active time: \(stats.totalActiveMinutes) min  |  Idle time: \(stats.totalIdleMinutes) min")
+        if let best = stats.bestUnit {
+            lines.append("Best \(stats.granularity.label): \(best.label) (\(best.avg))")
+        }
+        if let worst = stats.worstUnit {
+            lines.append("Worst \(stats.granularity.label): \(worst.label) (\(worst.avg))")
+        }
+        if !stats.peakHours.isEmpty {
+            lines.append("Peak hours (≥+10 above mean): " + stats.peakHours.map(formatHour12).joined(separator: ", "))
+        }
+        if !stats.sleepHours.isEmpty {
+            lines.append("Trough hours (≤-10 below mean): " + stats.sleepHours.map(formatHour12).joined(separator: ", "))
+        }
+        if !stats.mostlyIdleHours.isEmpty {
+            lines.append("Mostly idle hours (more AFK than active): " + stats.mostlyIdleHours.map(formatHour12).joined(separator: ", "))
+        }
+        if !stats.emptyHours.isEmpty {
+            lines.append("Empty hours (no activity logged at all): " + stats.emptyHours.map(formatHour12).joined(separator: ", "))
+        }
+        if !stats.topCategories.isEmpty {
+            let cats = stats.topCategories.map { "\($0.name) (\($0.minutes) min)" }.joined(separator: ", ")
+            lines.append("Top categories: \(cats)")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    // MARK: - Persistence
+
+    private func loadFromDisk() {
+        guard let data = try? Data(contentsOf: manifestURL) else { return }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        if let stored = try? decoder.decode(FocusScore.self, from: data) {
+            current = stored
+        }
+    }
+
+    private func saveToDisk() {
+        let dir = manifestURL.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(current) else { return }
+        try? data.write(to: manifestURL, options: .atomic)
+    }
+}
+
+// MARK: - Calendar summary
+
+/// Formats calendar events that overlap a focus-score window into a short bulleted list. Lives
+/// here (not on `CalendarFeedStore`) because the framing — "during this window" — is specific
+/// to the focus engine; chat-side context is built differently in `InsightsContextBuilder`.
+enum CalendarSummaryFormatter {
+    static func describe(events: [CalendarEvent], windowStart: Date, windowEnd: Date) -> String {
+        let overlapping = events.filter { $0.end > windowStart && $0.start < windowEnd }
+        guard !overlapping.isEmpty else { return "" }
+        let timeFormatter = DateFormatter()
+        timeFormatter.dateFormat = "h:mm a"
+        return overlapping.sorted { $0.start < $1.start }.map { event in
+            "- \"\(event.title)\" \(timeFormatter.string(from: event.start))–\(timeFormatter.string(from: event.end))"
+        }.joined(separator: "\n")
+    }
+}
+
+// MARK: - Host extraction
+
+/// Pulls a stable hostname from a tab URL: lowercased, with leading `www.` stripped. Returns
+/// nil for URLs that don't have a parseable host (chrome://, file://, blank, etc.). Used by
+/// the per-domain time aggregation so e.g. `mail.google.com` and `news.google.com` end up as
+/// distinct buckets.
+func extractHost(from urlString: String) -> String? {
+    guard !urlString.isEmpty,
+          let url = URL(string: urlString),
+          let host = url.host?.lowercased() else { return nil }
+    if host.hasPrefix("www.") {
+        return String(host.dropFirst(4))
+    }
+    return host
+}
+
+// MARK: - Window summary
+
+/// Derived stats over a time window. All seconds-valued so callers can format minutes themselves.
+struct WindowSummary {
+    struct AppTotal { let appName: String; let bundleID: String?; let seconds: TimeInterval }
+    /// Per-host bucket for browser activity. Each contributing event has a tabURL; this struct
+    /// remembers which app the host was visited under so we can fall back to the parent's
+    /// category when the host itself is uncategorized.
+    struct HostTotal {
+        let host: String
+        let parentAppName: String
+        let parentBundleID: String?
+        let seconds: TimeInterval
+    }
+
+    /// Active time only — idle has already been subtracted. This is the right denominator for
+    /// "how engaged were they?" calculations.
+    let totalSeconds: TimeInterval
+    /// Estimated AFK seconds inside the window. Surfaced separately so the prompt can mention it
+    /// (so the model can correlate it with calendar context — e.g. idle during a meeting block).
+    let idleSeconds: TimeInterval
+    let longestStreakSeconds: TimeInterval
+    let switches: Int
+    let distinctContexts: Int
+    /// Per-app totals sorted desc by seconds. Multiple windows of the same app get folded together.
+    let appTotals: [AppTotal]
+    /// Per-host totals (browsers only). When present, `topApps(in:)` substitutes domain rows
+    /// for the parent browser app in the digest the AI sees, so e.g. Chrome time gets split
+    /// into `gmail.com (25m)` and `theonion.com (12m)` with their own categories.
+    let hostTotals: [HostTotal]
+
+    /// Build from the activity event ring, keeping only events whose interval intersects the window.
+    /// Each event's contribution is reduced by the idle time recorded at its trailing edge so AFK
+    /// stretches don't pad streaks or app totals. The wall-clock total stays available too for any
+    /// caller that wants to know how much real time the window covers.
+    static func build(events: [ActivityWatcher.Event], start: Date, end: Date, settings: AppSettingsStore) -> WindowSummary {
+        var activeSeconds: TimeInterval = 0
+        var idleSeconds: TimeInterval = 0
+        var longestStreak: TimeInterval = 0
+        var switches = 0
+        var contextKeys: Set<String> = []
+        var appBuckets: [String: AppTotal] = [:]    // keyed by appName for visual stability
+        var hostBuckets: [String: HostTotal] = [:]  // keyed by host
+
+        var lastContextKey: String?
+        for event in events {
+            let evStart = event.timestamp
+            let evEnd = event.endTimestamp ?? event.timestamp
+            let clippedStart = max(evStart, start)
+            let clippedEnd = min(evEnd, end)
+            guard clippedEnd > clippedStart else { continue }
+            let wallDuration = clippedEnd.timeIntervalSince(clippedStart)
+
+            let evWallDuration = max(0.0001, evEnd.timeIntervalSince(evStart))
+            let idleAtEnd = event.idleSecondsAtCapture ?? 0
+            let idleInWindow = min(wallDuration, idleAtEnd * (wallDuration / evWallDuration))
+            let activeDuration = max(0, wallDuration - idleInWindow)
+
+            activeSeconds += activeDuration
+            idleSeconds += (wallDuration - activeDuration)
+            if activeDuration > longestStreak { longestStreak = activeDuration }
+
+            if activeDuration > 0 {
+                let contextKey = "\(event.appName)|\(event.windowTitle ?? "")|\(event.tabURL ?? "")"
+                contextKeys.insert(contextKey)
+                if let last = lastContextKey, last != contextKey { switches += 1 }
+                lastContextKey = contextKey
+
+                let key = event.appName
+                if let prev = appBuckets[key] {
+                    appBuckets[key] = AppTotal(appName: prev.appName, bundleID: prev.bundleID ?? event.bundleID, seconds: prev.seconds + activeDuration)
+                } else {
+                    appBuckets[key] = AppTotal(appName: event.appName, bundleID: event.bundleID, seconds: activeDuration)
+                }
+
+                // Per-host bucketing: only when the event is in a recognized browser AND the
+                // tab URL parses to a usable host. `extractHost` handles `www.` stripping and
+                // junk URLs; redacted private-window events have nil tabURL so they bypass.
+                if let urlString = event.tabURL, let host = extractHost(from: urlString) {
+                    if let prev = hostBuckets[host] {
+                        hostBuckets[host] = HostTotal(
+                            host: prev.host,
+                            parentAppName: prev.parentAppName,
+                            parentBundleID: prev.parentBundleID ?? event.bundleID,
+                            seconds: prev.seconds + activeDuration
+                        )
+                    } else {
+                        hostBuckets[host] = HostTotal(
+                            host: host,
+                            parentAppName: event.appName,
+                            parentBundleID: event.bundleID,
+                            seconds: activeDuration
+                        )
+                    }
+                }
+            }
+        }
+
+        let totals = appBuckets.values.sorted { $0.seconds > $1.seconds }
+        let hosts = hostBuckets.values.sorted { $0.seconds > $1.seconds }
+        return WindowSummary(
+            totalSeconds: activeSeconds,
+            idleSeconds: idleSeconds,
+            longestStreakSeconds: longestStreak,
+            switches: switches,
+            distinctContexts: contextKeys.count,
+            appTotals: totals,
+            hostTotals: hosts
+        )
+    }
+
+    /// Top entries as `FocusScore.TopApp` rows. For browser apps that produced any host data,
+    /// the parent app row is replaced by per-host rows so the AI sees `gmail.com (25m)` and
+    /// `theonion.com (12m)` separately rather than one undifferentiated `Chrome` lump. Each
+    /// host's category is resolved against `settings.domainCategories` first, falling back to
+    /// the parent app's category if the host hasn't been categorized.
+    func topApps(in settings: AppSettingsStore) -> [FocusScore.TopApp] {
+        // Apps that contributed any host data — those get expanded into domain rows.
+        let appsWithHosts = Set(hostTotals.map { $0.parentAppName })
+
+        var rows: [FocusScore.TopApp] = []
+
+        for app in appTotals where !appsWithHosts.contains(app.appName) {
+            rows.append(FocusScore.TopApp(
+                appName: app.appName,
+                bundleID: app.bundleID,
+                minutes: Int(app.seconds / 60),
+                category: app.bundleID.flatMap { settings.appCategories[$0] }
+            ))
+        }
+
+        for host in hostTotals {
+            let resolvedCategory = settings.domainCategories[host.host]
+                ?? host.parentBundleID.flatMap { settings.appCategories[$0] }
+            rows.append(FocusScore.TopApp(
+                appName: host.host,
+                bundleID: host.host,                          // reused as category-lookup key on display side
+                minutes: Int(host.seconds / 60),
+                category: resolvedCategory
+            ))
+        }
+
+        return rows
+            .sorted { $0.minutes > $1.minutes }
+            .prefix(8)
+            .map { $0 }
+    }
+}
