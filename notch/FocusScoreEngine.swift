@@ -84,16 +84,18 @@ final class FocusScoreEngine: ObservableObject {
     private let tickInterval: TimeInterval = 60 * 60
     private let windowDuration: TimeInterval = 60 * 60
     /// Bump whenever scoring rules change in a way that should invalidate older entries
-    /// (loginwindow filtering, idle accounting, the 10-min threshold, etc.). Entries persisted
-    /// with a lower stamp get auto-recomputed at launch by `autoRefreshOutdatedScores`.
-    static let currentScoringVersion: Int = 2
+    /// (loginwindow filtering, idle accounting, the 10-min threshold, the presence-multiplier
+    /// baseline, etc.). Entries persisted with a lower stamp get auto-recomputed at launch by
+    /// `autoRefreshOutdatedScores`.
+    static let currentScoringVersion: Int = 3
     /// Apps with at least this much time in the window are eligible to be queried for a category.
     private let categorizationMinSeconds: TimeInterval = 5 * 60
-    /// Minimum wall-clock presence (active + idle) required for an hour to be scored. Shared by
-    /// the live recompute and the backfill path so the same data produces the same outcome
-    /// regardless of how it lands in history. Stretches under this threshold are quick
-    /// check-ins, not meaningful hours of focus.
-    private let minScoredWallSeconds: TimeInterval = 10 * 60
+    /// Minimum ACTIVE time (idle subtracted) required for an hour to be scored. Switching from
+    /// wall-clock to active-only matters: an hour with 2 min of typing and 55 min of an
+    /// unlocked-but-AFK screen previously cleared a wall-clock gate but produced a wildly
+    /// inflated score. Now the gate matches the metric — only hours with meaningful actual
+    /// engagement get scored at all.
+    private let minScoredActiveSeconds: TimeInterval = 10 * 60
 
     private var timer: Timer?
     private var cancellables = Set<AnyCancellable>()
@@ -182,10 +184,9 @@ final class FocusScoreEngine: ObservableObject {
         let windowStart = now.addingTimeInterval(-windowDuration)
         let summary = WindowSummary.build(events: activity.events, start: windowStart, end: now, settings: settings)
 
-        // Skip empty / quick-check-in hours: same threshold backfill uses. A 5-min stretch
-        // isn't a meaningful "hour of focus" no matter what happened in it.
-        let wallSeconds = summary.totalSeconds + summary.idleSeconds
-        guard wallSeconds >= minScoredWallSeconds else { return }
+        // Skip empty / quick-check-in hours: at least 10 min of ACTIVE engagement (idle
+        // subtracted). An idle-heavy hour fails this even when wall time is large.
+        guard summary.totalSeconds >= minScoredActiveSeconds else { return }
 
         // Always compute a deterministic baseline so we have something even if Ollama is down.
         let baseline = baselineScore(from: summary)
@@ -231,20 +232,38 @@ final class FocusScoreEngine: ObservableObject {
 
     // MARK: - Baseline scoring
 
-    /// Cheap, deterministic score from streak/switch/diversity stats. Range 0-100. The model
-    /// usually nudges this; if Ollama is unavailable we ship the baseline as-is.
+    /// Cheap, deterministic score from streak/switch/diversity stats, multiplied by a presence
+    /// factor so idle-heavy hours can't score as high as fully-engaged ones. Range 0-100. The
+    /// model usually nudges this; if Ollama is unavailable we ship the baseline as-is.
+    ///
+    /// Why presence is needed: streakFraction divides longest streak by ACTIVE total, so a
+    /// 2-min uninterrupted streak inside a 2-min active window calculates as "100% deep
+    /// focus." Without correcting for the wall-clock context (60 min total, 58 min idle), an
+    /// almost-AFK hour scored a perfect 100. The presence factor scales the score down for
+    /// hours where the user was barely there.
     private func baselineScore(from summary: WindowSummary) -> Int {
         guard summary.totalSeconds > 0 else { return 0 }
-        // Longest streak as a fraction of the window — capped so a single long streak in a
-        // partial window doesn't blow past 1.0.
         let streakFraction = min(1.0, summary.longestStreakSeconds / max(60, summary.totalSeconds))
-        // Switches per minute → penalty curve. 0 switches = full credit, ≥6/min = full penalty.
         let switchesPerMin = Double(summary.switches) / max(1, summary.totalSeconds / 60)
         let switchPenalty = min(1.0, switchesPerMin / 6.0)
-        // Distinct contexts. 1-2 = focused, 6+ = scattered.
         let diversityPenalty = min(1.0, max(0, Double(summary.distinctContexts - 2)) / 6.0)
 
-        let raw = 0.6 * streakFraction + 0.4 * (1 - 0.6 * switchPenalty - 0.4 * diversityPenalty)
+        let depthScore = 0.6 * streakFraction + 0.4 * (1 - 0.6 * switchPenalty - 0.4 * diversityPenalty)
+
+        // Presence multiplier: a soft ramp. Below 50% active/wall, the score is dragged down;
+        // at 0% presence the multiplier bottoms out at 0.4 (not 0 — the AI nudge can rescue
+        // genuinely meeting-occupied hours from this floor when calendar context warrants).
+        let wallSeconds = summary.totalSeconds + summary.idleSeconds
+        let activityRatio = summary.totalSeconds / max(60, wallSeconds)
+        let presenceMultiplier: Double
+        if activityRatio >= 0.5 {
+            presenceMultiplier = 1.0
+        } else {
+            // Linear ramp from 0.4 (at 0% active) to 1.0 (at 50% active).
+            presenceMultiplier = 0.4 + 0.6 * (activityRatio / 0.5)
+        }
+
+        let raw = depthScore * presenceMultiplier
         return Int((max(0, min(1, raw)) * 100).rounded())
     }
 
@@ -638,9 +657,8 @@ final class FocusScoreEngine: ObservableObject {
             for window in hoursToBackfill {
                 guard let activity = self.activity, let settings = self.settings else { return }
                 let summary = WindowSummary.build(events: activity.events, start: window.start, end: window.end, settings: settings)
-                // Same threshold the live path uses; see `minScoredWallSeconds` declaration.
-                let wallSeconds = summary.totalSeconds + summary.idleSeconds
-                guard wallSeconds >= self.minScoredWallSeconds else { continue }
+                // Same threshold the live path uses; see `minScoredActiveSeconds` declaration.
+                guard summary.totalSeconds >= self.minScoredActiveSeconds else { continue }
                 let baseline = self.baselineScore(from: summary)
                 var finalScore = baseline
                 var commentary = self.defaultCommentary(for: summary, score: baseline)
@@ -873,9 +891,15 @@ final class FocusScoreEngine: ObservableObject {
             for window in hoursToRecompute {
                 guard let activity = self.activity, let settings = self.settings else { return }
                 let summary = WindowSummary.build(events: activity.events, start: window.start, end: window.end, settings: settings)
-                // If the cleaned log no longer has 60+ active seconds in this hour, the entry
-                // is no longer meaningful — drop it rather than rewriting to 0.
-                guard summary.totalSeconds >= 60 else { continue }
+                // If the rescore now finds less active time than the live path requires for a
+                // new score, the entry is no longer meaningful under current rules — delete it
+                // rather than rewriting it to a token-heavy near-zero. Same threshold as the
+                // live `recomputeNow` path uses, so live and rescore agree on what counts.
+                guard summary.totalSeconds >= self.minScoredActiveSeconds else {
+                    let hour = cal.component(.hour, from: window.end)
+                    self.history.deleteEntry(forDate: window.start, hour: hour)
+                    continue
+                }
                 let baseline = self.baselineScore(from: summary)
                 var finalScore = baseline
                 var commentary = self.defaultCommentary(for: summary, score: baseline)
