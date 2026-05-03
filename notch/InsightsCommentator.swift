@@ -49,10 +49,22 @@ final class InsightsCommentator: ObservableObject {
         case skippedDisabled = "Skipped — toggle off"
         case skippedBusy = "Skipped — chat in progress"
         case skippedNoContext = "Skipped — no useful context"
+        case skippedTransient = "Skipped — transient frontmost app"
         case modelEmpty = "Model returned empty"
         case modelSentinel = "Model said -"
         case modelError = "Model errored"
     }
+
+    /// Bundle IDs the commentator refuses to riff on when they're frontmost. These are
+    /// "transit apps" — the user is moving between things, not doing focused work, so any
+    /// remark would either feel random or accidentally drag down the conversation. Distinct
+    /// from `AppSettingsStore.isIgnoredBundleID` (which is the harder "never even count this
+    /// as activity" predicate) — Finder time still counts as activity, just shouldn't trigger
+    /// commentary.
+    private let transientBundleIDs: Set<String> = [
+        "com.apple.finder",
+        "com.apple.systempreferences"
+    ]
 
     @Published private(set) var lastTickAt: Date?
     @Published private(set) var lastTickResult: LastTickResult?
@@ -150,6 +162,14 @@ final class InsightsCommentator: ObservableObject {
         // since-quit app or a since-switched window. The commentator then riffs on something
         // the user is no longer doing.
         activity.captureNow()
+
+        // Skip commentary when the user is parked in a transient app (Finder, System Settings).
+        // These are transit between things; commenting on them produces awkward riffs about
+        // file management or settings changes that the user isn't focused on.
+        if let id = activity.latestEvent?.bundleID, transientBundleIDs.contains(id) {
+            lastTickResult = .skippedTransient
+            return
+        }
 
         let context = InsightsContextBuilder.build(activity: activity, calendar: calendar)
         // Skip if we have no useful context — a "??" comment would feel random.

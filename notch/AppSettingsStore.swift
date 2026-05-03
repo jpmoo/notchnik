@@ -170,7 +170,7 @@ final class AppSettingsStore: ObservableObject {
     /// Bumped whenever the seed tables below are extended. On launch we apply seeds for any
     /// key the user hasn't already categorized, then persist the new version. Existing users
     /// pick up new seed rows when they upgrade.
-    static let currentSeedVersion: Int = 1
+    static let currentSeedVersion: Int = 2
 
     /// Sensible defaults for well-known macOS apps. Keys are bundle IDs. Categories are
     /// lowercase to match the conversational/UI convention. The user can override any of these
@@ -203,10 +203,12 @@ final class AppSettingsStore: ObservableObject {
         "com.figma.Desktop":             "design",
         "com.adobe.Photoshop":           "design",
         "com.bohemiancoding.sketch3":    "design",
-        // Admin / planning
+        // Admin / planning / system
         "com.apple.iCal":                "admin",
         "com.flexibits.fantastical2.mac": "admin",
         "com.culturedcode.ThingsMac":    "admin",
+        "com.apple.finder":              "admin",
+        "com.apple.systempreferences":   "admin",
         // Entertainment
         "com.spotify.client":            "entertainment",
         "com.apple.Music":               "entertainment",
