@@ -1,6 +1,6 @@
 # NotchNik
 
-A macOS utility that lives in (and around) the hardware notch on MacBook Pros. Hover the notch and it swells; click it and a panel drops down with a clipboard history, a calendar agenda, a file-parking pen, and an AI chat that watches what you're doing and scores your focus.
+A macOS utility that lives in (and around) the hardware notch on MacBooks. Hover the notch and it swells; click it and a panel drops down with a clipboard history, a calendar agenda, a file-parking pen, and an AI chat that watches what you're doing and scores your focus.
 
 > **This codebase is entirely vibe-coded.** Written interactively with an LLM doing most of the typing across many sessions, with the human steering, vetoing, and shaping intent. There's no architectural master plan; pieces accreted as ideas came up. Treat it as such — the code style is consistent within a session and drifts across sessions, comments explain *why* things landed where they did rather than what the code is doing, and a fair amount of design rationale lives in commit-style review rather than design docs.
 
