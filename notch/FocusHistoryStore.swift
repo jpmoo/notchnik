@@ -98,6 +98,25 @@ final class FocusHistoryStore: ObservableObject {
         return entries(in: interval)
     }
 
+    /// Most recent persisted entry across all day files, by `windowEnd`. Walks days from today
+    /// backward until it finds one with entries. Used as the "catch up since here" anchor for
+    /// the backfill / wake-from-sleep path.
+    func mostRecentEntry() -> FocusScore? {
+        var dayCursor = Date()
+        // Walk back at most 60 days. If history is sparser than that, the user almost
+        // certainly doesn't care about reconstruction here; backfill will fall back to
+        // scanning from the earliest activity event.
+        for _ in 0..<60 {
+            let entries = self.entries(for: dayCursor)
+            if let latest = entries.max(by: { $0.windowEnd < $1.windowEnd }) {
+                return latest
+            }
+            guard let prev = calendar.date(byAdding: .day, value: -1, to: dayCursor) else { return nil }
+            dayCursor = prev
+        }
+        return nil
+    }
+
     /// Scans the last `daysBack` days of history for top-app entries that have no category
     /// assigned. Returns two lists (apps, domains), each sorted desc by total minutes seen.
     /// Used by Settings → Insights to nudge the user about apps/domains that have shown up

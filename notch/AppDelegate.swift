@@ -186,6 +186,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.positionExpandedPanel(panel)
             }
         }
+
+        // Wake from sleep: macOS suspends Timer firing during sleep, so the activity watcher's
+        // 30-second tick AND the focus engine's hourly tick both miss everything that would
+        // have happened during the sleep window. On wake we force a fresh capture, a backfill
+        // pass to fill any hours the activity log can cover, and a recompute of the current
+        // hour — getting the chart and the pill back in sync with reality.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.activityWatcher.captureNow()
+                await self.focusScoreEngine.recomputeNow()
+                self.focusScoreEngine.backfillMissingHours()
+            }
+        }
     }
 
     /// Single source of truth for whether the watcher should be running. Combines the persisted

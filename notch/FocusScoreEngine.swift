@@ -573,44 +573,54 @@ final class FocusScoreEngine: ObservableObject {
     /// triggers another recompute in the middle of an already-running backfill.
     @Published private(set) var isBackfilling: Bool = false
 
-    /// Walks the activity log and fills focus-history gaps for any hour with activity but no
-    /// score. Each backfilled hour gets the same AI commentary path as the live compute — the
-    /// goal is parity with current-hour entries, not "deterministic placeholders." Throttled to
-    /// one model call at a time and run as an unstructured Task so it doesn't block the UI.
-    /// Calendar context overlapping each hour is included so e.g. an idle hour during a meeting
-    /// is interpreted correctly.
-    func backfillMissingHours(daysBack: Int = 3) {
+    /// "Catch me up since the last time we scored." Anchors on the most recent persisted score
+    /// and scores every hour from that hour forward to (but not including) the current one.
+    /// Existing entries within the scan range get OVERWRITTEN — the user's intent is to
+    /// re-score even a previously-scored hour, since the data informing that score may have
+    /// been incomplete (e.g., the timer fired mid-hour, or a sleep stretch was missing events
+    /// when the original score was written).
+    ///
+    /// When there's no scored history yet, falls back to scanning from the earliest event in
+    /// the activity log — that's the natural bound; the log's retention setting handles the
+    /// upper limit.
+    ///
+    /// Each backfilled hour gets the same AI-refined commentary as the live compute. Throttled
+    /// to one model call at a time and run as an unstructured Task so it doesn't block the UI.
+    func backfillMissingHours() {
         guard !isBackfilling else { return }
-        // Same pattern as `autoRefreshOutdatedScores`: precondition-check `settings` for
-        // non-nil but don't bind it; the inner Task re-fetches `self.settings`.
         guard let activity, settings != nil else { return }
         let events = activity.events
         guard !events.isEmpty else { return }
-
-        // Identify candidate hours up front so the long-running task doesn't have to re-scan
-        // the events array on every iteration.
         let cal = Calendar.current
         let now = Date()
-        let earliestAllowed = cal.date(byAdding: .day, value: -daysBack, to: now) ?? now
-        guard let firstInRange = events.first(where: { $0.timestamp >= earliestAllowed }) else { return }
-        let scanStart = max(firstInRange.timestamp, earliestAllowed)
+
+        // Anchor: most recent scored hour's start, or earliest activity event if no history.
+        // Walking forward from this anchor, we re-score / fill every hour up to (but not
+        // including) the current hour.
+        let scanStart: Date
+        if let latest = history.mostRecentEntry() {
+            scanStart = latest.windowStart
+        } else if let earliestEvent = events.first {
+            scanStart = earliestEvent.timestamp
+        } else {
+            return
+        }
+
         var cursor = cal.date(bySettingHour: cal.component(.hour, from: scanStart), minute: 0, second: 0, of: scanStart) ?? scanStart
         let currentHourStart = cal.date(bySettingHour: cal.component(.hour, from: now), minute: 0, second: 0, of: now) ?? now
 
         var hoursToBackfill: [(start: Date, end: Date)] = []
         while cursor < currentHourStart {
             guard let nextHour = cal.date(byAdding: .hour, value: 1, to: cursor) else { break }
-            let existing = history.entries(for: cursor)
-            let hourOfWindowEnd = cal.component(.hour, from: nextHour)
-            let alreadyScored = existing.contains { cal.component(.hour, from: $0.windowEnd) == hourOfWindowEnd }
-            if !alreadyScored {
-                let intersects = events.contains { event in
-                    let eventEnd = event.endTimestamp ?? event.timestamp
-                    return event.timestamp < nextHour && eventEnd > cursor
-                }
-                if intersects {
-                    hoursToBackfill.append((start: cursor, end: nextHour))
-                }
+            // No "alreadyScored" check — the user explicitly wants existing entries within
+            // the scan range to be re-scored. Hours with no eligible activity are the only
+            // ones we skip.
+            let intersects = events.contains { event in
+                let eventEnd = event.endTimestamp ?? event.timestamp
+                return event.timestamp < nextHour && eventEnd > cursor
+            }
+            if intersects {
+                hoursToBackfill.append((start: cursor, end: nextHour))
             }
             cursor = nextHour
         }
@@ -767,7 +777,9 @@ final class FocusScoreEngine: ObservableObject {
         // Backfill walks the activity log and recreates every eligible hour. With history now
         // empty, every hour is "missing" and gets scored fresh under the current rules and
         // category map.
-        backfillMissingHours(daysBack: 365)
+        // After wiping, the most-recent-entry anchor returns nil, so backfill falls through
+        // to "scan from earliest activity event" — which is what we want here.
+        backfillMissingHours()
     }
 
     /// Re-score persisted entries within the recent past (default: today + yesterday). When

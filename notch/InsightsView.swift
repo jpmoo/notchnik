@@ -2155,23 +2155,24 @@ final class FocusScoreDetailPresenter: NSObject, NSWindowDelegate {
         if panel?.isVisible == true {
             close()
         } else {
-            // Background passes that prep what the user is about to see:
-            //   1. Take an AI guess at any apps/domains that don't have categories yet, so
-            //      the score-prompt's category weighting has more to work with. After this
-            //      pass, only genuinely ambiguous items will still need user input.
-            //   2. Refresh today + yesterday's scores so they reflect any new categories
-            //      and the latest rules. No-op when entries are already current.
-            // Both are async; neither blocks the panel from appearing.
+            // Background passes that prep what the user is about to see. None of these block
+            // the panel from appearing — it opens immediately, contents fill in async.
             Task { @MainActor in
+                // 1. Recompute the current hour. Catches the common case where the user
+                //    woke from sleep and the hourly Timer hasn't fired yet, so the pill is
+                //    stale. Cheap (one model call) but eliminates the "score is hours old"
+                //    surprise when opening after a long break.
+                await engine.recomputeNow()
+                // 2. Backfill any hours the activity log covers but never got scored —
+                //    typically the result of system sleep suspending the engine's timer.
+                engine.backfillMissingHours()
+                // 3. AI guess at categories for any uncategorized apps/domains.
                 let applied = await engine.aiCategorizeUncategorized(daysBack: 14)
-                // Only refresh after categorization completes — the autoRefresh treats a
-                // category-revision change as stale, so doing it second avoids a duplicate
-                // refresh wave.
-                if applied > 0 {
-                    engine.autoRefreshOutdatedScores(daysBack: 2)
-                } else {
-                    engine.autoRefreshOutdatedScores(daysBack: 2)
-                }
+                // 4. Refresh today+yesterday's scores so they reflect any new categories
+                //    and the latest rules. The applied count from step 3 doesn't change
+                //    behavior here — we always run the refresh.
+                _ = applied
+                engine.autoRefreshOutdatedScores(daysBack: 2)
             }
             present(engine: engine, settings: settings)
         }
