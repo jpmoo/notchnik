@@ -85,9 +85,9 @@ final class FocusScoreEngine: ObservableObject {
     private let windowDuration: TimeInterval = 60 * 60
     /// Bump whenever scoring rules change in a way that should invalidate older entries
     /// (loginwindow filtering, idle accounting, the 10-min threshold, the presence-multiplier
-    /// baseline, etc.). Entries persisted with a lower stamp get auto-recomputed at launch by
-    /// `autoRefreshOutdatedScores`.
-    static let currentScoringVersion: Int = 3
+    /// baseline, calendar-as-primary-context prompt, host/app-level streaks, etc.). Entries
+    /// persisted with a lower stamp get auto-recomputed at launch by `autoRefreshOutdatedScores`.
+    static let currentScoringVersion: Int = 7
     /// Apps with at least this much time in the window are eligible to be queried for a category.
     private let categorizationMinSeconds: TimeInterval = 5 * 60
     /// Minimum ACTIVE time (idle subtracted) required for an hour to be scored. Switching from
@@ -182,7 +182,7 @@ final class FocusScoreEngine: ObservableObject {
 
         let now = Date()
         let windowStart = now.addingTimeInterval(-windowDuration)
-        let summary = WindowSummary.build(events: activity.events, start: windowStart, end: now, settings: settings)
+        let summary = WindowSummary.build(events: activity.events, start: windowStart, end: now, settings: settings, calendarEvents: calendar?.events ?? [])
 
         // Skip empty / quick-check-in hours: at least 10 min of ACTIVE engagement (idle
         // subtracted). An idle-heavy hour fails this even when wall time is large.
@@ -250,16 +250,21 @@ final class FocusScoreEngine: ObservableObject {
 
         let depthScore = 0.6 * streakFraction + 0.4 * (1 - 0.6 * switchPenalty - 0.4 * diversityPenalty)
 
-        // Presence multiplier: a soft ramp. Below 50% active/wall, the score is dragged down;
-        // at 0% presence the multiplier bottoms out at 0.4 (not 0 — the AI nudge can rescue
-        // genuinely meeting-occupied hours from this floor when calendar context warrants).
-        let wallSeconds = summary.totalSeconds + summary.idleSeconds
-        let activityRatio = summary.totalSeconds / max(60, wallSeconds)
+        // Presence multiplier: a soft ramp. Below 50% active vs. the FULL WALL-CLOCK window
+        // (NOT the sum of captured event durations — those two diverge when the user walked
+        // away and no events were logged), the score is dragged down. At 0% presence the
+        // multiplier bottoms out at 0.4 (not 0 — the AI nudge can rescue genuinely meeting-
+        // occupied hours from this floor when calendar context warrants).
+        //
+        // Earlier the denominator was `totalSeconds + idleSeconds`, which made a user who
+        // was at the machine 12 min then walked away for 48 min look like 100% present —
+        // because the 48-min absence didn't appear in any event so it didn't accrue to wall
+        // time. Honest fix is to compare against the actual window length.
+        let activityRatio = summary.totalSeconds / max(60, summary.windowSeconds)
         let presenceMultiplier: Double
         if activityRatio >= 0.5 {
             presenceMultiplier = 1.0
         } else {
-            // Linear ramp from 0.4 (at 0% active) to 1.0 (at 50% active).
             presenceMultiplier = 0.4 + 0.6 * (activityRatio / 0.5)
         }
 
@@ -298,7 +303,7 @@ final class FocusScoreEngine: ObservableObject {
         Compute a focus score for the last hour of the user's desktop activity.
 
         Stats:
-        - Longest unbroken active streak in one app/window: \(Int(summary.longestStreakSeconds / 60)) min
+        - Longest unbroken active streak on one app or website: \(Int(summary.longestStreakSeconds / 60)) min
         - Total context switches: \(summary.switches)
         - Distinct contexts (app+window+tab): \(summary.distinctContexts)
         - Active time (idle subtracted): \(activeMin) min
@@ -311,18 +316,27 @@ final class FocusScoreEngine: ObservableObject {
         Calendar during this window:
         \(calendarContext.isEmpty ? "(no events on calendar)" : calendarContext)
 
-        If significant idle time overlaps a calendar event in the context above, treat it as the \
-        user being in that meeting rather than slacking. Adjust the score upward in that case and \
-        say so in the commentary. Idle time outside of meetings is a focus negative.
+        Calendar takes priority over app categories when interpreting this hour. When a calendar \
+        event is IN PROGRESS during this window, the user's activity is most likely in service of \
+        that event — whatever app is frontmost (Slides, Zoom, browser, Slack, Notes, IDE) is being \
+        used to participate in, run, or take notes during the meeting. Score the hour as engaged \
+        work in that case, regardless of whether the apps themselves are categorized as productive. \
+        The only time to override this is when dominant apps are clearly off-task in a way that \
+        wouldn't plausibly serve the meeting (e.g., heavy time on social/entertainment with no \
+        meeting connection).
 
-        Weight the KIND of time, not just the depth. The streak/switch numbers can look pristine \
-        for activities that aren't focused work — an uninterrupted hour of solitaire, doomscrolling, \
-        or YouTube watch parties is not a 90. If the top apps' categories are dominated by social, \
-        entertainment, games, or other low-engagement uses, the score should reflect that the user \
-        wasn't doing meaningful work even if the behavioral metrics look clean. Conversely, hours \
-        dominated by categories like coding, writing, design, research, or comms should keep their \
-        high baseline when behavior also looks focused. When categories are missing or "uncategorized" \
-        for most apps, fall back to the baseline; don't guess.
+        Important: the deterministic baseline ALREADY credits idle minutes inside a meeting block \
+        as active. So if you see "Active time" looking strong despite a meeting in progress, that's \
+        because the math has already done the meeting accounting — don't add a second upward boost \
+        on top of it. Use the calendar context to interpret the activity, not to inflate the score \
+        a second time.
+
+        When NO calendar event is in progress, weight the KIND of time. The streak/switch numbers \
+        can look pristine for activities that aren't focused work — an uninterrupted hour of \
+        solitaire, doomscrolling, or YouTube watch parties is not a 90. Hours dominated by social, \
+        entertainment, or games should score lower than hours dominated by coding, writing, \
+        design, research, comms, or admin — even when behavioral metrics are similar. Hours with \
+        mostly uncategorized apps fall back to the baseline; don't guess wildly.
 
         Respond with ONLY a JSON object on a single line, no prose, no code fences:
         {"score": <0-100 integer>, "commentary": "<one or two short sentences in your voice>"}
@@ -656,7 +670,7 @@ final class FocusScoreEngine: ObservableObject {
             defer { self.isBackfilling = false }
             for window in hoursToBackfill {
                 guard let activity = self.activity, let settings = self.settings else { return }
-                let summary = WindowSummary.build(events: activity.events, start: window.start, end: window.end, settings: settings)
+                let summary = WindowSummary.build(events: activity.events, start: window.start, end: window.end, settings: settings, calendarEvents: self.calendar?.events ?? [])
                 // Same threshold the live path uses; see `minScoredActiveSeconds` declaration.
                 guard summary.totalSeconds >= self.minScoredActiveSeconds else { continue }
                 let baseline = self.baselineScore(from: summary)
@@ -683,9 +697,115 @@ final class FocusScoreEngine: ObservableObject {
                 )
                 self.history.record(score)
             }
+            // Sync engine.current with whatever is now the most recent persisted entry so
+            // the pill / Now tab match the Day view. Without this, recompute and rescore
+            // could update history while leaving `current` stuck on its previous value.
+            self.refreshCurrentFromHistory()
             // Cached range insights computed mid-backfill are now stale.
             self.rangeInsights.removeAll()
         }
+    }
+
+    /// Re-reads the most recent persisted entry from history and assigns it to `current` if
+    /// it differs. Persists on change. Called at the end of any path that mutates history
+    /// outside of `recomputeNow` (backfill, auto-refresh).
+    private func refreshCurrentFromHistory() {
+        guard let latest = history.mostRecentEntry() else { return }
+        if current != latest {
+            current = latest
+            saveToDisk()
+        }
+    }
+
+    /// Plain-language readout of what the engine sees for a given hour. Used by the Day view's
+    /// diagnostic button so the user can answer "why doesn't this hour have a score?" without
+    /// shipping log files. Pure read — doesn't write anything.
+    struct HourDiagnostic {
+        let windowStart: Date
+        let windowEnd: Date
+        let activeMinutes: Int
+        let idleMinutes: Int
+        let wallMinutes: Int
+        let longestStreakMinutes: Int
+        let switches: Int
+        let distinctContexts: Int
+        /// Same `FocusScore.TopApp` shape used by scored entries — apps + domains, with
+        /// category resolved against current settings — so the Day view can render them
+        /// horizontally via the same `FlowApps` component on both scored and skipped hours.
+        let topApps: [FocusScore.TopApp]
+        let baselinePresenceMultiplier: Double  // 0.4 ... 1.0
+        let baseline: Int                       // 0 ... 100
+        let thresholdMinActiveMinutes: Int
+        let willScore: Bool
+        let summary: String                     // human-readable headline
+    }
+
+    func diagnose(date: Date, hour: Int) -> HourDiagnostic {
+        let cal = Calendar.current
+        let dayStart = cal.startOfDay(for: date)
+        let windowStart = cal.date(bySettingHour: hour, minute: 0, second: 0, of: dayStart) ?? dayStart
+        let windowEnd = cal.date(byAdding: .hour, value: 1, to: windowStart) ?? windowStart
+        return diagnose(windowStart: windowStart, windowEnd: windowEnd)
+    }
+
+    private func diagnose(windowStart: Date, windowEnd: Date) -> HourDiagnostic {
+        let events = activity?.events ?? []
+        let settings = settings
+        let summary = settings.map {
+            WindowSummary.build(events: events, start: windowStart, end: windowEnd, settings: $0, calendarEvents: calendar?.events ?? [])
+        } ?? WindowSummary(
+            totalSeconds: 0, idleSeconds: 0,
+            windowSeconds: windowEnd.timeIntervalSince(windowStart),
+            longestStreakSeconds: 0,
+            switches: 0, distinctContexts: 0, appTotals: [], hostTotals: []
+        )
+        let activeMin = Int(summary.totalSeconds / 60)
+        let idleMin = Int(summary.idleSeconds / 60)
+        let wallMin = activeMin + idleMin
+        // Reuse the same topApps resolution as scored entries so apps + domains + categories
+        // come out consistently. Empty when settings is nil (no AppSettingsStore available).
+        let topApps: [FocusScore.TopApp] = settings.map { summary.topApps(in: $0) } ?? []
+        let thresholdMin = Int(minScoredActiveSeconds / 60)
+        let willScore = summary.totalSeconds >= minScoredActiveSeconds
+
+        // Compute baseline + presence the same way the live path does, so the user sees what
+        // the score would have been (or what a previously-scored value was derived from).
+        let baseline = baselineScore(from: summary)
+        let activityRatio = summary.totalSeconds / max(60, summary.totalSeconds + summary.idleSeconds)
+        let presence: Double = activityRatio >= 0.5 ? 1.0 : 0.4 + 0.6 * (activityRatio / 0.5)
+
+        let summaryText: String
+        if events.isEmpty {
+            summaryText = "Activity log is empty — the watcher hasn't captured anything yet."
+        } else if activeMin == 0 && wallMin == 0 {
+            summaryText = "No activity events overlap this hour. Either the user wasn't at the machine or the watcher wasn't running."
+        } else if activeMin == 0 {
+            summaryText = "Wall-clock presence (\(wallMin) min) but zero active engagement — the user was at the machine but never touching keyboard / mouse / trackpad."
+        } else if !willScore {
+            summaryText = "Active time (\(activeMin) min) is below the \(thresholdMin)-min minimum. This hour gets skipped — the engine treats it as too sparse to score honestly."
+        } else if presence < 1.0 {
+            let multStr = String(format: "%.0f", presence * 100)
+            summaryText = "Above threshold but presence multiplier (\(multStr)%) drags the score down — \(activeMin) of \(wallMin) wall-clock minutes were active. Baseline = \(baseline)."
+        } else {
+            summaryText = "Eligible. Baseline = \(baseline) before any AI nudge. Presence multiplier 100% (active for half or more of the wall window)."
+        }
+
+        return HourDiagnostic(
+            windowStart: windowStart,
+            windowEnd: windowEnd,
+            activeMinutes: activeMin,
+            idleMinutes: idleMin,
+            wallMinutes: wallMin,
+            longestStreakMinutes: Int(summary.longestStreakSeconds / 60),
+            switches: summary.switches,
+            distinctContexts: summary.distinctContexts,
+            topApps: topApps,
+            baselinePresenceMultiplier: presence,
+            baseline: baseline,
+            thresholdMinActiveMinutes: thresholdMin,
+            willScore: willScore,
+            summary: summaryText
+        )
     }
 
     /// Calendar events overlapping a single hour, formatted the same way `recomputeNow` does
@@ -877,6 +997,9 @@ final class FocusScoreEngine: ObservableObject {
         }
         if !hoursToDelete.isEmpty {
             rangeInsights.removeAll()
+            // If we just deleted the entry behind engine.current, the pill would otherwise
+            // keep showing the deleted hour. Pull the now-most-recent entry forward.
+            refreshCurrentFromHistory()
         }
 
         guard !hoursToRecompute.isEmpty else { return }
@@ -890,7 +1013,7 @@ final class FocusScoreEngine: ObservableObject {
             defer { self.isBackfilling = false }
             for window in hoursToRecompute {
                 guard let activity = self.activity, let settings = self.settings else { return }
-                let summary = WindowSummary.build(events: activity.events, start: window.start, end: window.end, settings: settings)
+                let summary = WindowSummary.build(events: activity.events, start: window.start, end: window.end, settings: settings, calendarEvents: self.calendar?.events ?? [])
                 // If the rescore now finds less active time than the live path requires for a
                 // new score, the entry is no longer meaningful under current rules — delete it
                 // rather than rewriting it to a token-heavy near-zero. Same threshold as the
@@ -920,6 +1043,9 @@ final class FocusScoreEngine: ObservableObject {
                 )
                 self.history.record(score)
             }
+            // See comment in `backfillMissingHours` — keep `current` aligned with the latest
+            // persisted entry so pill / Now tab agree with Day view.
+            self.refreshCurrentFromHistory()
             self.rangeInsights.removeAll()
         }
     }
@@ -1038,6 +1164,11 @@ struct WindowSummary {
     /// Estimated AFK seconds inside the window. Surfaced separately so the prompt can mention it
     /// (so the model can correlate it with calendar context — e.g. idle during a meeting block).
     let idleSeconds: TimeInterval
+    /// Wall-clock duration of the scoring window (always 3600s for an hourly score). Stored
+    /// because the `totalSeconds + idleSeconds` sum is NOT the window length — it's the sum of
+    /// *captured event durations*, which can be much smaller when the user walked away from
+    /// the machine and no events were logged. The presence multiplier needs the real window.
+    let windowSeconds: TimeInterval
     let longestStreakSeconds: TimeInterval
     let switches: Int
     let distinctContexts: Int
@@ -1067,8 +1198,11 @@ struct WindowSummary {
         return false
     }
 
-    static func build(events: [ActivityWatcher.Event], start: Date, end: Date, settings: AppSettingsStore) -> WindowSummary {
+    static func build(events: [ActivityWatcher.Event], start: Date, end: Date, settings: AppSettingsStore, calendarEvents: [CalendarEvent] = []) -> WindowSummary {
         let events = events.filter { !isIgnoredEvent($0) }
+        // Pre-filter calendar events to those overlapping this window — saves checking the
+        // full feed on every activity event below.
+        let overlappingMeetings = calendarEvents.filter { $0.start < end && $0.end > start }
         var activeSeconds: TimeInterval = 0
         var idleSeconds: TimeInterval = 0
         var longestStreak: TimeInterval = 0
@@ -1077,7 +1211,27 @@ struct WindowSummary {
         var appBuckets: [String: AppTotal] = [:]    // keyed by appName for visual stability
         var hostBuckets: [String: HostTotal] = [:]  // keyed by host
 
+        // Streak tracking is at the host/app level, NOT per-URL. A user clicking from inbox
+        // to a single email inside Gmail used to break the streak (URL changes); now it
+        // doesn't. The streak ends only when the host or non-browser app changes, OR when
+        // there's a meaningful time gap between events (sleep, AFK, switching out and back).
+        // Activity-log events stay URL-granular for log fidelity; this is just a per-call
+        // re-aggregation.
         var lastContextKey: String?
+        var currentStreakKey: String?
+        var currentStreakSeconds: TimeInterval = 0
+        var currentStreakEnd: Date?
+        let maxStreakGap: TimeInterval = 5 * 60   // > 5 min gap breaks the streak
+
+        func closeStreak() {
+            if currentStreakSeconds > longestStreak {
+                longestStreak = currentStreakSeconds
+            }
+            currentStreakKey = nil
+            currentStreakSeconds = 0
+            currentStreakEnd = nil
+        }
+
         for event in events {
             let evStart = event.timestamp
             let evEnd = event.endTimestamp ?? event.timestamp
@@ -1089,11 +1243,47 @@ struct WindowSummary {
             let evWallDuration = max(0.0001, evEnd.timeIntervalSince(evStart))
             let idleAtEnd = event.idleSecondsAtCapture ?? 0
             let idleInWindow = min(wallDuration, idleAtEnd * (wallDuration / evWallDuration))
-            let activeDuration = max(0, wallDuration - idleInWindow)
+
+            // Calendar-aware idle credit: when the activity event overlaps a meeting on the
+            // calendar, idle minutes inside it count as ACTIVE. The user is in the meeting
+            // (Zoom listening, in-person presenting, taking notes) — the keyboard not moving
+            // doesn't mean unfocused. The previous behavior penalized meeting hours; this
+            // change makes the deterministic baseline honest about meetings BEFORE any AI
+            // nudge, so the AI doesn't have to fight the math.
+            let inMeeting = overlappingMeetings.contains { $0.start < clippedEnd && $0.end > clippedStart }
+            let activeDuration: TimeInterval = inMeeting
+                ? wallDuration
+                : max(0, wallDuration - idleInWindow)
 
             activeSeconds += activeDuration
             idleSeconds += (wallDuration - activeDuration)
-            if activeDuration > longestStreak { longestStreak = activeDuration }
+
+            // Streak key: host for browser-with-URL events, app for everything else. Same
+            // host (e.g., mail.google.com across multiple emails) keeps the streak alive.
+            let streakKey: String = {
+                if let url = event.tabURL, !url.isEmpty, let host = extractHost(from: url) {
+                    return "host:\(host)"
+                }
+                return "app:\(event.bundleID ?? event.appName)"
+            }()
+
+            // Time gap from the previous streak's end to this event's clipped start. A long
+            // gap means the user was away or doing something else even if the key matches.
+            let gap: TimeInterval
+            if let lastEnd = currentStreakEnd {
+                gap = clippedStart.timeIntervalSince(lastEnd)
+            } else {
+                gap = .infinity
+            }
+
+            if streakKey == currentStreakKey, gap <= maxStreakGap {
+                currentStreakSeconds += activeDuration
+            } else {
+                closeStreak()
+                currentStreakKey = streakKey
+                currentStreakSeconds = activeDuration
+            }
+            currentStreakEnd = clippedEnd
 
             if activeDuration > 0 {
                 let contextKey = "\(event.appName)|\(event.windowTitle ?? "")|\(event.tabURL ?? "")"
@@ -1130,12 +1320,15 @@ struct WindowSummary {
                 }
             }
         }
+        // Close the final running streak before returning.
+        closeStreak()
 
         let totals = appBuckets.values.sorted { $0.seconds > $1.seconds }
         let hosts = hostBuckets.values.sorted { $0.seconds > $1.seconds }
         return WindowSummary(
             totalSeconds: activeSeconds,
             idleSeconds: idleSeconds,
+            windowSeconds: end.timeIntervalSince(start),
             longestStreakSeconds: longestStreak,
             switches: switches,
             distinctContexts: contextKeys.count,

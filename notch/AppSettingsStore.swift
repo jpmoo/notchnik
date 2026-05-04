@@ -170,7 +170,7 @@ final class AppSettingsStore: ObservableObject {
     /// Bumped whenever the seed tables below are extended. On launch we apply seeds for any
     /// key the user hasn't already categorized, then persist the new version. Existing users
     /// pick up new seed rows when they upgrade.
-    static let currentSeedVersion: Int = 2
+    static let currentSeedVersion: Int = 3
 
     /// Sensible defaults for well-known macOS apps. Keys are bundle IDs. Categories are
     /// lowercase to match the conversational/UI convention. The user can override any of these
@@ -226,6 +226,21 @@ final class AppSettingsStore: ObservableObject {
         "outlook.office.com":  "comms",
         "fastmail.com":        "comms",
         "calendar.google.com": "admin",
+        "meet.google.com":     "comms",
+        "zoom.us":             "comms",
+        "app.zoom.us":         "comms",
+        "teams.microsoft.com": "comms",
+        // Docs / authoring (Google Workspace, Office on the web, Notion, etc.)
+        "docs.google.com":     "writing",
+        "drive.google.com":    "admin",
+        "sheets.google.com":   "writing",
+        "slides.google.com":   "writing",
+        "office.com":          "writing",
+        "office.live.com":     "writing",
+        "onedrive.live.com":   "admin",
+        "notion.so":           "writing",
+        "www.notion.so":       "writing",
+        "dropbox.com":         "admin",
         // Coding / docs
         "github.com":          "coding",
         "gitlab.com":          "coding",

@@ -9,20 +9,69 @@
 import Foundation
 
 extension String {
-    /// Trims whitespace, then strips one layer of balanced surrounding quotes (straight or
-    /// curly) if both ends carry them. Used to normalize model replies that come back
-    /// "wrapped in a quote" — Qwen and a couple of other models occasionally do this when
-    /// they interpret "give me a remark" as "give me a quotation."
+    /// Trims whitespace, then strips common formatting artifacts the model leaks into one-shot
+    /// replies: surrounding quotes (straight, single, curly), code fences (triple-backtick
+    /// blocks or single-backtick spans), and leading bullet markers (`- ` or `* `). Applied
+    /// iteratively so combined wrappers (`- "text"`, `` `- text` ``) all collapse in one pass.
+    /// Single sentence replies that the model thought should be "a bullet" or "a quote" or
+    /// "a code snippet" come back as plain text.
     func strippingSurroundingQuotes() -> String {
+        var current = self.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Iterate until nothing changes — handles nested / combined wrappers.
+        while true {
+            let next = current.strippedOnePass()
+            if next == current { return current }
+            current = next
+        }
+    }
+
+    /// Removes one outer layer of recognizable wrapping. Internal helper for the iterative
+    /// pass above. Order matters: code-fence checks run before quote checks because a fence
+    /// might contain quotes that aren't really "surrounding."
+    fileprivate func strippedOnePass() -> String {
         let trimmed = self.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.count >= 2 else { return trimmed }
+        guard !trimmed.isEmpty else { return trimmed }
+
+        // Leading bullet marker: "- foo" or "* foo" → "foo". Only strip when the line is a
+        // single bullet — multi-line bulleted content stays intact.
+        if !trimmed.contains("\n") {
+            if trimmed.hasPrefix("- ") {
+                return String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            if trimmed.hasPrefix("* ") {
+                return String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+
+        // Triple-backtick fence (with optional language tag): ```lang\nbody\n```
+        if trimmed.hasPrefix("```") && trimmed.hasSuffix("```") && trimmed.count > 6 {
+            var inner = String(trimmed.dropFirst(3).dropLast(3))
+            // Drop a leading "lang\n" if present.
+            if let newline = inner.firstIndex(of: "\n") {
+                let possibleLang = inner[inner.startIndex..<newline]
+                if possibleLang.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "-" }) {
+                    inner = String(inner[inner.index(after: newline)...])
+                }
+            }
+            return inner.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        // Single-backtick wrapping: `text` (only when both ends; not for inline code in prose).
+        if trimmed.count >= 2,
+           trimmed.first == "`", trimmed.last == "`",
+           !trimmed.dropFirst().dropLast().contains("`") {
+            return String(trimmed.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        // Surrounding quotes (straight, single, curly).
         let openers: Set<Character> = ["\"", "'", "\u{201C}", "\u{2018}"]
         let closers: Set<Character> = ["\"", "'", "\u{201D}", "\u{2019}"]
-        if let first = trimmed.first, let last = trimmed.last,
+        if trimmed.count >= 2,
+           let first = trimmed.first, let last = trimmed.last,
            openers.contains(first), closers.contains(last) {
-            return String(trimmed.dropFirst().dropLast())
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return String(trimmed.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
         }
+
         return trimmed
     }
 }

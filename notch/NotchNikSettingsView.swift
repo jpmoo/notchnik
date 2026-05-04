@@ -887,37 +887,164 @@ private struct CommentatorDiagnostics: View {
     }
 }
 
-/// Inline list of bundle ID → category mappings used by the focus-score engine. Built up as the
-/// AI asks the user about unfamiliar apps in chat; this editor lets the user fix mis-parses,
-/// rename a category, or drop an entry entirely. Adding new entries is intentionally NOT exposed
-/// here — categorization happens through conversation, not configuration.
+/// Inline list of bundle ID → category mappings used by the focus-score engine. Search box for
+/// quick filtering, scroll cap so the list doesn't run away on long histories, and an "Add
+/// app" menu that lets the user pick from currently-running apps that aren't categorized yet.
 private struct AppCategoriesEditor: View {
     @EnvironmentObject private var settings: AppSettingsStore
 
-    private var rows: [(bundleID: String, category: String)] {
+    @State private var search: String = ""
+    @State private var pendingAddBundleID: String?
+    @State private var pendingAddDisplayName: String?
+
+    /// Hard cap on visible rows before scrolling kicks in. 15 is a balance: enough to scan
+    /// without scroll, not so many the editor pushes the rest of Settings off-screen.
+    private static let maxVisibleRows = 15
+    private static let approxRowHeight: CGFloat = 28
+
+    private var allRows: [(bundleID: String, category: String)] {
         settings.appCategories
             .map { ($0.key, $0.value) }
             .sorted { $0.0 < $1.0 }
     }
 
+    private var filteredRows: [(bundleID: String, category: String)] {
+        guard !search.isEmpty else { return allRows }
+        let q = search.lowercased()
+        return allRows.filter { $0.bundleID.lowercased().contains(q) || $0.category.lowercased().contains(q) }
+    }
+
+    /// Currently-running apps with a regular activation policy that don't already have a
+    /// category and aren't on the hard-ignore list. Sorted by display name. Recomputed every
+    /// time the menu opens so newly-launched apps appear without re-rendering the editor.
+    private var addableRunningApps: [(bundleID: String, name: String)] {
+        NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular }
+            .compactMap { app -> (bundleID: String, name: String)? in
+                guard let bid = app.bundleIdentifier, !bid.isEmpty else { return nil }
+                if AppSettingsStore.isIgnoredBundleID(bid) { return nil }
+                if settings.appCategories[bid] != nil { return nil }
+                let name = app.localizedName ?? bid
+                return (bid, name)
+            }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("App Categories")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.secondary)
-            if rows.isEmpty {
-                Text("No categories yet — the assistant will ask about apps as you use them.")
+            HStack {
+                Text("App Categories")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Menu {
+                    let candidates = addableRunningApps
+                    if candidates.isEmpty {
+                        Text("No running apps left to categorize.")
+                    } else {
+                        ForEach(candidates, id: \.bundleID) { app in
+                            Button("\(app.name)  —  \(app.bundleID)") {
+                                pendingAddBundleID = app.bundleID
+                                pendingAddDisplayName = app.name
+                            }
+                        }
+                    }
+                } label: {
+                    Label("Add app", systemImage: "plus.circle")
+                        .font(.system(size: 11))
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+            }
+
+            if !allRows.isEmpty {
+                TextField("Search apps or categories", text: $search)
+                    .textFieldStyle(.roundedBorder)
+                    .controlSize(.small)
+            }
+
+            if let bundleID = pendingAddBundleID, let name = pendingAddDisplayName {
+                NewCategoryDraftRow(label: name, sublabel: bundleID) { category in
+                    settings.setAppCategory(bundleID: bundleID, category: category)
+                    pendingAddBundleID = nil
+                    pendingAddDisplayName = nil
+                } onCancel: {
+                    pendingAddBundleID = nil
+                    pendingAddDisplayName = nil
+                }
+            }
+
+            if filteredRows.isEmpty {
+                Text(allRows.isEmpty
+                     ? "No categories yet — pick from running apps with the Add menu, or let the assistant ask in chat as you go."
+                     : "No matches.")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
             } else {
-                VStack(spacing: 4) {
-                    ForEach(rows, id: \.bundleID) { row in
-                        AppCategoryRow(bundleID: row.bundleID, category: row.category)
+                ScrollView(.vertical, showsIndicators: filteredRows.count > Self.maxVisibleRows) {
+                    VStack(spacing: 4) {
+                        ForEach(filteredRows, id: \.bundleID) { row in
+                            AppCategoryRow(bundleID: row.bundleID, category: row.category)
+                        }
                     }
                 }
+                .frame(maxHeight: CGFloat(min(filteredRows.count, Self.maxVisibleRows)) * Self.approxRowHeight)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// Inline form rendered above the list when the user has picked something to add (an app
+/// from the running-apps menu, or a domain from the open-tabs menu) but hasn't yet typed a
+/// category. Shared between AppCategoriesEditor and DomainCategoriesEditor.
+private struct NewCategoryDraftRow: View {
+    let label: String
+    let sublabel: String?
+    let onSave: (String) -> Void
+    let onCancel: () -> Void
+
+    @State private var draft: String = ""
+    @FocusState private var fieldFocused: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 0) {
+                Text(label)
+                    .font(.system(size: 11, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if let sub = sublabel {
+                    Text(sub)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            TextField("category", text: $draft)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 140)
+                .focused($fieldFocused)
+                .onSubmit(commit)
+
+            Button("Save", action: commit).buttonStyle(.borderless)
+            Button("Cancel", action: onCancel).buttonStyle(.borderless)
+        }
+        .padding(8)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color.accentColor.opacity(0.10))
+        )
+        .onAppear { fieldFocused = true }
+    }
+
+    private func commit() {
+        let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { onCancel(); return }
+        onSave(trimmed)
     }
 }
 
@@ -1210,34 +1337,112 @@ private struct HistoryMaintenance: View {
     }
 }
 
-/// Inline list of host → category mappings used by the per-domain scoring path. Mirrors the
-/// app-category editor's shape so the two sit side-by-side. Entries are added conversationally
-/// (when the assistant asks about a domain) or by the seed table; this editor lets the user
-/// rename or remove.
+/// Mirrors AppCategoriesEditor — search, scroll cap, and an "Add domain" menu populated from
+/// active tabs across running supported browsers (Safari, Chrome and forks, Arc, Dia).
 private struct DomainCategoriesEditor: View {
     @EnvironmentObject private var settings: AppSettingsStore
 
-    private var rows: [(host: String, category: String)] {
+    @State private var search: String = ""
+    @State private var pendingAddHost: String?
+    @State private var pendingAddTitle: String?
+
+    private static let maxVisibleRows = 15
+    private static let approxRowHeight: CGFloat = 28
+
+    private var allRows: [(host: String, category: String)] {
         settings.domainCategories
             .map { ($0.key, $0.value) }
             .sorted { $0.0 < $1.0 }
     }
 
+    private var filteredRows: [(host: String, category: String)] {
+        guard !search.isEmpty else { return allRows }
+        let q = search.lowercased()
+        return allRows.filter { $0.host.lowercased().contains(q) || $0.category.lowercased().contains(q) }
+    }
+
+    /// One active tab per running supported browser, as long as the host isn't already
+    /// categorized. Synchronous AppleScript per browser — short list, runs only when the menu
+    /// is opened.
+    private var addableOpenTabs: [(host: String, title: String)] {
+        let supported = Set(BrowserContextFetcher.supportedBundleIDs)
+        let runningBrowsers = NSWorkspace.shared.runningApplications
+            .compactMap { $0.bundleIdentifier }
+            .filter { supported.contains($0) }
+
+        var seen: Set<String> = []
+        var results: [(host: String, title: String)] = []
+        for bid in runningBrowsers {
+            guard let context = BrowserContextFetcher.fetch(bundleID: bid),
+                  let url = context.url,
+                  let host = extractHost(from: url) else { continue }
+            if settings.domainCategories[host] != nil { continue }
+            if seen.contains(host) { continue }
+            seen.insert(host)
+            results.append((host: host, title: context.title ?? host))
+        }
+        return results.sorted { $0.host < $1.host }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Domain Categories")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.secondary)
-            if rows.isEmpty {
-                Text("No domain categories yet — gmail.com, theonion.com, etc. get categorized here so browser time can be weighted per-site instead of as one Chrome bucket.")
+            HStack {
+                Text("Domain Categories")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Menu {
+                    let candidates = addableOpenTabs
+                    if candidates.isEmpty {
+                        Text("No open tabs left to categorize.")
+                    } else {
+                        ForEach(candidates, id: \.host) { tab in
+                            Button("\(tab.host)  —  \(tab.title)") {
+                                pendingAddHost = tab.host
+                                pendingAddTitle = tab.title
+                            }
+                        }
+                    }
+                } label: {
+                    Label("Add from open tab", systemImage: "plus.circle")
+                        .font(.system(size: 11))
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+            }
+
+            if !allRows.isEmpty {
+                TextField("Search domains or categories", text: $search)
+                    .textFieldStyle(.roundedBorder)
+                    .controlSize(.small)
+            }
+
+            if let host = pendingAddHost {
+                NewCategoryDraftRow(label: host, sublabel: pendingAddTitle) { category in
+                    settings.setDomainCategory(host: host, category: category)
+                    pendingAddHost = nil
+                    pendingAddTitle = nil
+                } onCancel: {
+                    pendingAddHost = nil
+                    pendingAddTitle = nil
+                }
+            }
+
+            if filteredRows.isEmpty {
+                Text(allRows.isEmpty
+                     ? "No domain categories yet — pick from open tabs with Add, or let the assistant ask in chat."
+                     : "No matches.")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
             } else {
-                VStack(spacing: 4) {
-                    ForEach(rows, id: \.host) { row in
-                        DomainCategoryRow(host: row.host, category: row.category)
+                ScrollView(.vertical, showsIndicators: filteredRows.count > Self.maxVisibleRows) {
+                    VStack(spacing: 4) {
+                        ForEach(filteredRows, id: \.host) { row in
+                            DomainCategoryRow(host: row.host, category: row.category)
+                        }
                     }
                 }
+                .frame(maxHeight: CGFloat(min(filteredRows.count, Self.maxVisibleRows)) * Self.approxRowHeight)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)

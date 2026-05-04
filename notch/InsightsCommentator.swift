@@ -50,10 +50,41 @@ final class InsightsCommentator: ObservableObject {
         case skippedBusy = "Skipped — chat in progress"
         case skippedNoContext = "Skipped — no useful context"
         case skippedTransient = "Skipped — transient frontmost app"
+        case skippedSameContext = "Skipped — same context as recent comment"
         case modelEmpty = "Model returned empty"
         case modelSentinel = "Model said -"
         case modelError = "Model errored"
     }
+
+    /// What was in focus when the commentator last produced a comment. Used to suppress
+    /// repeat-observation comments when the user has been parked on the same thing for a
+    /// while ("you're still on slide 4" * 6).
+    private struct LastCommentContext: Equatable {
+        let appName: String
+        let windowTitle: String?
+        let tabURL: String?
+        let at: Date
+    }
+    private var lastCommentContext: LastCommentContext?
+
+    /// How long the same-context guard suppresses. After this stretch the commentator gets
+    /// another shot — same activity over hours is itself worth remarking on, just not at
+    /// every 5-min tick.
+    private let sameContextSuppressionWindow: TimeInterval = 2 * 60 * 60
+
+    /// Last (app, window, tab) we saw on the activity watcher's latestEvent. Used to detect
+    /// genuine context transitions for the event-driven tick.
+    private struct ContextFingerprint: Equatable {
+        let appName: String
+        let windowTitle: String?
+        let tabURL: String?
+    }
+    private var lastSeenContext: ContextFingerprint?
+    private var contextChangeDebounce: Task<Void, Never>?
+    /// How long we wait after a context change before firing. Filters incidental clicking
+    /// around (alt-tab through several apps to find one); only fires once the user has
+    /// settled.
+    private let contextChangeSettleDelay: TimeInterval = 90
 
     /// Bundle IDs the commentator refuses to riff on when they're frontmost. These are
     /// "transit apps" — the user is moving between things, not doing focused work, so any
@@ -92,6 +123,39 @@ final class InsightsCommentator: ObservableObject {
                     if enabled { self?.start() } else { self?.stop() }
                 }
             }
+
+        // Event-driven trigger: subscribe to context changes on the activity watcher. A real
+        // transition (different app / window / tab) schedules a tick after a settle delay so
+        // we don't fire on incidental cmd-tab flicker. Combined with the existing same-context
+        // guard (which suppresses repeats), this makes most commentary land on transitions
+        // rather than fixed timer ticks. The 5-min timer stays as a baseline.
+        activity.$latestEvent
+            .sink { [weak self] event in
+                Task { @MainActor in self?.handleContextChange(event) }
+            }
+            .store(in: &cancellables)
+    }
+
+    private var cancellables: Set<AnyCancellable> = []
+
+    private func handleContextChange(_ event: ActivityWatcher.Event?) {
+        guard let event else { return }
+        let current = ContextFingerprint(
+            appName: event.appName,
+            windowTitle: event.windowTitle,
+            tabURL: event.tabURL
+        )
+        if lastSeenContext == current { return }
+        lastSeenContext = current
+
+        // Cancel any pending settle and start a fresh one. If the user keeps flipping
+        // contexts, only the final settled context produces a tick.
+        contextChangeDebounce?.cancel()
+        contextChangeDebounce = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64((self?.contextChangeSettleDelay ?? 90) * 1_000_000_000))
+            guard let self, !Task.isCancelled else { return }
+            await self.tick()
+        }
     }
 
     deinit {
@@ -171,6 +235,24 @@ final class InsightsCommentator: ObservableObject {
             return
         }
 
+        // Same-context guard: if the user is still on the exact same app + window + URL we
+        // commented on within the last couple of hours, skip. Saves the user from a stream of
+        // "you're still on slide 4" / "still looking at slide 4" / "now seeing slide 4 for the
+        // sixth time" observations that the model produces because the situation hasn't
+        // changed but it's been told to comment. The suppression window expires so we'll
+        // eventually fire again on a stretch that genuinely has lasted hours — that itself is
+        // worth a remark.
+        if let last = lastCommentContext,
+           let current = activity.latestEvent,
+           !forceFire,
+           Date().timeIntervalSince(last.at) < sameContextSuppressionWindow,
+           last.appName == current.appName,
+           last.windowTitle == current.windowTitle,
+           last.tabURL == current.tabURL {
+            lastTickResult = .skippedSameContext
+            return
+        }
+
         let context = InsightsContextBuilder.build(activity: activity, calendar: calendar)
         // Skip if we have no useful context — a "??" comment would feel random.
         guard !context.isEmpty else {
@@ -197,8 +279,59 @@ final class InsightsCommentator: ObservableObject {
         "the screen's a hearth", named slides, named documents, etc.).
         - Vary sentence length and opening word from your previous turns.
 
-        Comment on what is happening NOW — i.e., the "Currently in focus" block below. Do not riff \
-        on items under "Earlier today" as if they were still on screen; those apps may be closed.
+        Self-coverage rule: scan your own previous assistant turns above. If you have already \
+        commented (even once) on whatever is currently in focus — same app, same window, same \
+        tab/URL — do NOT comment on it again, even with different phrasing. The user has \
+        already read those comments; repeating yourself creatively is worse than silence. \
+        Exceptions: a calendar event has just begun or ended (genuinely new context), or the \
+        user has been at this so long that the duration itself is the new observation. \
+        Otherwise, return "-" alone and stay silent.
+
+        ABSOLUTE USER OVERRIDE — read carefully. Before composing this turn:
+
+        1. Scan EVERY user message above (not just the most recent — ALL of them).
+        2. For each calendar event listed in "Calendar context" below, and for each app/site \
+        listed in the focus or earlier-today blocks, ask: has the user said anything about it?
+        3. If the user has clarified, corrected, or contextualized any item — even casually \
+        ("that's my kid's class", "she's home sick", "this isn't mine", "just helping a friend", \
+        "ignore that meeting") — that clarification is BINDING and PERMANENT for the rest of \
+        the conversation. The user is ground truth; the calendar and activity data are not.
+        4. NEVER mention an item the user has already spoken about. Don't re-raise it, don't \
+        reference it indirectly, don't ask about it. Move on to something the user has NOT \
+        commented on, or stay silent.
+
+        Concrete: if the user said "Anna's home sick, she didn't go to dance class" and the \
+        calendar shows "Dance class IN PROGRESS," DO NOT mention dance class. The user has \
+        already settled what's happening with that block.
+
+        Comment on what is happening NOW. Three signals to integrate, in priority order:
+
+        1. CALENDAR. When a calendar event is IN PROGRESS, the user is in that meeting / block, \
+        and whatever app is frontmost is being used in service of it. Comment on the meeting and \
+        how the activity fits its purpose, not on the literal app. ("Running point on the slides \
+        for the council session" beats "you're staring at slide 4 again.")
+
+        2. IDLE. The "Idle (no input): X min" line is real — the user hasn't touched the \
+        keyboard or trackpad in X minutes. Interpret it like this:
+           - 0–2 min idle: actively engaged with the surface app. Comment on the activity.
+           - 3–8 min idle: reading, thinking, on a brief break, or in a meeting listening. \
+           Don't assume active engagement. If a calendar event is in progress, comment on the \
+           meeting; if not, the comment can acknowledge the pause ("standing back from X").
+           - 9–15 min idle: user may have stepped away. Don't claim they're "doing" anything \
+           on screen. If a calendar event is in progress, treat as in-meeting and not at the \
+           keyboard. If not, the comment should reflect "stepped away" honestly, not project \
+           activity onto the frozen screen.
+           (You won't see >15 min idle here — the system suppresses commentary above that.)
+
+        3. SURFACE APP. Use what's frontmost only after considering the above. The app is the \
+        weakest of the three signals on its own.
+
+        Do not riff on items under "Earlier today" as if they were still on screen; those apps \
+        may be closed.
+
+        FINAL CHECK before responding: re-read the user's most recent few messages one more \
+        time. If anything you were about to say touches on a calendar event, app, or topic the \
+        user has already addressed — drop it. Pick something fresh, or return "-" alone.
 
         Only return the single character "-" (and nothing else) if you would otherwise be exactly \
         repeating a previous turn. Otherwise, say something.
@@ -210,11 +343,12 @@ final class InsightsCommentator: ObservableObject {
             observationContext: observation
         )
 
-        // Send the model only its last few turns. Sending the full transcript made the model
-        // *more* repetitive, not less — it pattern-matches on its own dominant style across many
-        // turns and reproduces it. A short tail is enough to anchor against immediate echoes
-        // without giving it a self-trained voice template to riff on.
-        let recentTail = Array(chat.messages.suffix(8))
+        // History strategy: send a longer tail than before so user corrections and context
+        // notes ("she's sick, not going to class") survive into the prompt. Truncation was
+        // dropping those, leading to the commentator re-running canned riffs about already-
+        // corrected calendar items. The anti-repetition pressure from echoing one's own
+        // style is now handled in the prompt rules above (anti-pattern + self-coverage).
+        let recentTail = Array(chat.messages.suffix(40))
         var payload: [OllamaClient.ChatMessage] = [
             OllamaClient.ChatMessage(role: .system, content: systemPrompt)
         ]
@@ -242,6 +376,16 @@ final class InsightsCommentator: ObservableObject {
             }
             chat.appendAssistant(cleaned)
             lastCommentAt = Date()
+            // Snapshot the context so the same-context guard above can recognize "still on
+            // the same thing" on the next tick.
+            if let current = activity.latestEvent {
+                lastCommentContext = LastCommentContext(
+                    appName: current.appName,
+                    windowTitle: current.windowTitle,
+                    tabURL: current.tabURL,
+                    at: Date()
+                )
+            }
             lastTickResult = .fired
         } catch {
             // Autonomous — never surface errors to the user, but record the result for the

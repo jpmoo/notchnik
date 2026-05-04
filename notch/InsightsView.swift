@@ -713,16 +713,30 @@ private struct FocusScorePill: View {
     let isComputing: Bool
     let action: () -> Void
 
+    /// True when the persisted "current" score covers the user's current hour. If it does not
+    /// (e.g., the live tick skipped this hour because active time was below threshold, or the
+    /// app was asleep), the pill renders blank. The Now tab can still show the previous
+    /// score's content; we just don't pretend the pill represents *right now* when it doesn't.
+    private var isCurrentHour: Bool {
+        guard let score else { return false }
+        let cal = Calendar.current
+        let nowHourStart = cal.date(bySettingHour: cal.component(.hour, from: Date()), minute: 0, second: 0, of: Date()) ?? Date()
+        // The score's windowEnd is the end of the hour it scored (e.g., 14:00 for the 13:00–14:00
+        // hour). If windowEnd >= the current hour's start, the score is fresh enough to display.
+        return score.windowEnd >= nowHourStart
+    }
+
     private var displayValue: String {
-        guard let score else { return "—" }
+        guard let score, isCurrentHour else { return "—" }
         return "\(score.value)"
     }
 
     private var tint: Color {
-        guard let score else { return Color.white.opacity(0.25) }
+        guard let score, isCurrentHour else { return Color.white.opacity(0.25) }
         switch score.value {
-        case ..<35: return Color.red.opacity(0.75)
-        case ..<65: return Color.orange.opacity(0.75)
+        case ..<25: return Color.red.opacity(0.75)
+        case ..<50: return Color.orange.opacity(0.75)
+        case ..<75: return Color.yellow.opacity(0.75)
         default:    return Color.green.opacity(0.75)
         }
     }
@@ -972,6 +986,7 @@ private struct NowSection: View {
 /// "Day" tab content — date navigator + 24-bar chart + per-hour detail.
 private struct DaySection: View {
     @ObservedObject var history: FocusHistoryStore
+    @EnvironmentObject private var focusEngine: FocusScoreEngine
     @Binding var selectedDate: Date
     @State private var selectedHour: Int? = nil
 
@@ -1069,20 +1084,35 @@ private struct DaySection: View {
 
             Divider()
 
-            // Per-hour detail panel
-            if let entry = selectedEntry {
-                HourDetail(entry: entry)
-            } else if entries.isEmpty {
-                Text("No focus scores recorded for this day.")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-            } else {
-                Text("Click a bar to see that hour's commentary.")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+            // Per-hour detail panel. Wrapped in a ScrollView so longer diagnostic readouts
+            // (which can exceed the panel's fixed height) remain reachable.
+            // - Hour with score → HourDetail.
+            // - Hour without score (selected) → HourDiagnosticView (explains why).
+            // - No hour selected → prompt to click a bar.
+            ScrollView(.vertical, showsIndicators: false) {
+                if let entry = selectedEntry {
+                    HourDetail(entry: entry)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else if let hour = selectedHour {
+                    HourDiagnosticView(diagnostic: focusEngine.diagnose(date: selectedDate, hour: hour))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else if entries.isEmpty {
+                    Text("No focus scores recorded for this day. Click any bar to diagnose what the engine sees for that hour.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.vertical, 24)
+                } else {
+                    Text("Click a bar to see that hour's commentary or, for empty bars, a diagnostic readout.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.vertical, 24)
+                }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
         .onAppear { defaultSelectionForCurrentDate() }
         .onChange(of: selectedDate) { _, _ in defaultSelectionForCurrentDate() }
@@ -1124,9 +1154,93 @@ private struct DaySection: View {
     }
 }
 
-/// Per-hour detail row shown below the bar chart when a bar is selected.
+/// Plain-language readout of why a particular hour has no score, or what the engine sees for
+/// it more generally. Shown in place of `HourDetail` when the user selects an empty bar.
+private struct HourDiagnosticView: View {
+    let diagnostic: FocusScoreEngine.HourDiagnostic
+
+    private static let timeFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "h:mm a"
+        return f
+    }()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Image(systemName: diagnostic.willScore ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                    .foregroundStyle(diagnostic.willScore ? .green : .orange)
+                Text("\(Self.timeFmt.string(from: diagnostic.windowStart))–\(Self.timeFmt.string(from: diagnostic.windowEnd))")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+
+            Text(diagnostic.summary)
+                .font(.system(size: 12))
+                .fixedSize(horizontal: false, vertical: true)
+
+            HourStatsGrid(diagnostic: diagnostic)
+                .padding(.top, 2)
+
+            // Match the scored-hour layout: horizontal scrolling FlowApps row, not a
+            // vertical list. Skipped hours and scored hours read the same way.
+            if !diagnostic.topApps.isEmpty {
+                FlowApps(apps: diagnostic.topApps)
+            }
+        }
+    }
+}
+
+/// Shared stats grid used by both `HourDetail` (scored hours) and `HourDiagnosticView`
+/// (skipped/empty hours). Surfaces the underlying numbers — active/idle/wall, longest
+/// streak, switches, distinct contexts, baseline, presence multiplier, threshold.
+private struct HourStatsGrid: View {
+    let diagnostic: FocusScoreEngine.HourDiagnostic
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            statRow(label: "Active time",       value: "\(diagnostic.activeMinutes) min", muted: false)
+            statRow(label: "Idle time",         value: "\(diagnostic.idleMinutes) min",   muted: false)
+            statRow(label: "Wall time",         value: "\(diagnostic.wallMinutes) min",   muted: true)
+            statRow(label: "Threshold",         value: "≥ \(diagnostic.thresholdMinActiveMinutes) min active", muted: true)
+            statRow(label: "Longest streak",    value: "\(diagnostic.longestStreakMinutes) min", muted: true)
+            statRow(label: "Context switches",  value: "\(diagnostic.switches)",          muted: true)
+            statRow(label: "Distinct contexts", value: "\(diagnostic.distinctContexts)",  muted: true)
+            if diagnostic.willScore {
+                statRow(label: "Baseline score", value: "\(diagnostic.baseline)/100", muted: false)
+                let multStr = String(format: "%.0f%%", diagnostic.baselinePresenceMultiplier * 100)
+                statRow(label: "Presence multiplier", value: multStr, muted: true)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func statRow(label: String, value: String, muted: Bool) -> some View {
+        HStack {
+            Text(label)
+                .font(.system(size: 11))
+                .foregroundStyle(muted ? .tertiary : .secondary)
+            Spacer()
+            Text(value)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(muted ? .tertiary : .primary)
+        }
+    }
+}
+
+/// Per-hour detail row shown below the bar chart when a bar is selected. Shows the score +
+/// commentary + top apps the user already wrote, plus the same diagnostic stats grid the
+/// no-score path renders — so a scored hour and a skipped hour both surface the underlying
+/// numbers (active/idle/wall, longest streak, switches, distinct contexts, baseline,
+/// presence multiplier, threshold).
 private struct HourDetail: View {
     let entry: FocusScore
+    @EnvironmentObject private var focusEngine: FocusScoreEngine
+
+    private var diagnostic: FocusScoreEngine.HourDiagnostic {
+        focusEngine.diagnose(date: entry.windowStart, hour: Calendar.current.component(.hour, from: entry.windowEnd))
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1152,6 +1266,11 @@ private struct HourDetail: View {
             Text(entry.commentary)
                 .font(.system(size: 12))
                 .fixedSize(horizontal: false, vertical: true)
+
+            // Stats grid: parity with the no-score diagnostic view so users always see the
+            // underlying numbers, not just the headline score + commentary.
+            HourStatsGrid(diagnostic: diagnostic)
+                .padding(.top, 2)
 
             if !entry.topApps.isEmpty {
                 FlowApps(apps: entry.topApps)
@@ -1257,7 +1376,10 @@ private struct DayBarChart: View {
         )
         .contentShape(Rectangle())
         .onTapGesture {
-            if entry != nil { selectedHour = hour }
+            // Empty bars are now selectable too — selection of an empty hour shows a
+            // diagnostic readout instead of HourDetail. Lets the user investigate "why is
+            // there no score for this hour?"
+            selectedHour = hour
         }
         .help(barTooltip(hour: hour, entry: entry))
     }
@@ -2122,10 +2244,14 @@ private struct SummaryCard: View {
 }
 
 /// Shared score-color ramp. Used by both the Now circle and the Day bars/avg readout.
+/// Four-band score color ramp shared by every score visualization. Tighter at the bottom and
+/// top so a 24 reads as clearly bad and a 75 reads as clearly good, with two intermediate
+/// bands for the "okay" / "decent" middle ground.
 private func scoreColor(_ value: Int) -> Color {
     switch value {
-    case ..<35: return .red
-    case ..<65: return .orange
+    case ..<25: return .red
+    case ..<50: return .orange
+    case ..<75: return .yellow
     default:    return .green
     }
 }
@@ -2185,6 +2311,10 @@ final class FocusScoreDetailPresenter: NSObject, NSWindowDelegate {
         let view = FocusScoreDetailView(score: engine.current, onClose: { [weak self] in
             self?.close()
         }, settings: settings, focusEngine: engine)
+            // Inject the engine as an environment object too — DaySection (and any descendant)
+            // reads it via `@EnvironmentObject` for the diagnostic readout.
+            .environmentObject(engine)
+            .environmentObject(settings)
 
         let hosting = NSHostingView(rootView: view)
         hosting.frame = NSRect(x: 0, y: 0, width: 720, height: 480)

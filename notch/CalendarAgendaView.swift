@@ -19,7 +19,9 @@ struct CalendarAgendaView: View {
 
     /// Vertical pixels per hour. 40 keeps 24h ≈ 960pt — plenty scrollable, but each 30-min meeting
     /// is still 20pt tall (one short word fits).
-    private let hourHeight: CGFloat = 40
+    /// 60pt per hour gives 15 min = 15pt — tight but readable for a short title. Smaller
+    /// values made 15-min events shrink to ~10pt and the title got crushed.
+    private let hourHeight: CGFloat = 60
     private let timeColumnWidth: CGFloat = 44
     private let timeColumnSpacing: CGFloat = 8
 
@@ -318,9 +320,18 @@ private struct TimelineDayView: View {
                                 .foregroundStyle(.white.opacity(0.4))
                                 .frame(width: timeColumnWidth, alignment: .trailing)
                                 .offset(y: -4)
-                            Rectangle()
-                                .fill(Color.white.opacity(0.07))
-                                .frame(height: 1)
+                            // Hour line plus three faint 15-min subdivisions, drawn as a
+                            // VStack so each line settles at the right y inside the hour cell.
+                            VStack(spacing: 0) {
+                                Rectangle().fill(Color.white.opacity(0.07)).frame(height: 1)
+                                Spacer(minLength: 0)
+                                Rectangle().fill(Color.white.opacity(0.025)).frame(height: 1)
+                                Spacer(minLength: 0)
+                                Rectangle().fill(Color.white.opacity(0.04)).frame(height: 1)
+                                Spacer(minLength: 0)
+                                Rectangle().fill(Color.white.opacity(0.025)).frame(height: 1)
+                                Spacer(minLength: 0)
+                            }
                         }
                         .frame(maxWidth: .infinity)
                         .frame(height: hourHeight, alignment: .top)
@@ -341,24 +352,34 @@ private struct TimelineDayView: View {
                                 visibleStart: block.visibleStart,
                                 visibleEnd: block.visibleEnd
                             )
+                            // 4pt vertical inset (2 from height, 2 added to y-offset) so
+                            // blocks ending and starting at the same time don't visually kiss.
+                            // Width keeps its 2pt inset — column splitting is uncommon enough
+                            // that horizontal gap matters less.
                             .frame(
                                 width: max(20, (trackWidth / CGFloat(block.totalColumns)) - 2),
-                                height: max(18, blockHeight(start: block.visibleStart, end: block.visibleEnd) - 2)
+                                height: max(16, blockHeight(start: block.visibleStart, end: block.visibleEnd) - 4)
                             )
                             .offset(
                                 x: trackOriginX
                                     + (CGFloat(block.column) * (trackWidth / CGFloat(block.totalColumns))),
-                                y: yForTime(block.visibleStart) + 1
+                                y: yForTime(block.visibleStart) + 2
                             )
                         }
 
                         if isToday, let nowY = yForTimeIfWithinDay(now) {
                             NowLine(width: geo.size.width)
                                 .offset(y: nowY)
+                                // The now-line is decorative; let hover pass through it to
+                                // any event block underneath.
+                                .allowsHitTesting(false)
                         }
                     }
                 }
-                .allowsHitTesting(false)
+                // Previously the entire layer had .allowsHitTesting(false), which silenced
+                // every event's `.help()` tooltip. With it removed, hover surfaces the
+                // tooltip; events have no tap action so they don't intercept clicks meant
+                // for the scroll view.
             }
             .frame(height: hourHeight * 24)
         }
@@ -475,36 +496,43 @@ private struct EventBlock: View {
     }()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 1) {
+        // All on one row: title (truncated if long), times, optional location. Title carries
+        // a higher layoutPriority so it gets first claim on horizontal space; the times +
+        // location squeeze and truncate when there isn't room.
+        HStack(spacing: 6) {
             Text(event.title)
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(.white)
-                .lineLimit(2)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .layoutPriority(1)
+            Spacer(minLength: 0)
             Text(timeRange)
                 .font(.system(size: 9))
                 .foregroundStyle(.white.opacity(0.85))
                 .monospacedDigit()
+                .lineLimit(1)
             if let location = event.location, !location.isEmpty {
+                Text("·").foregroundStyle(.white.opacity(0.5))
                 Text(location)
                     .font(.system(size: 9))
-                    .foregroundStyle(.white.opacity(0.7))
+                    .foregroundStyle(.white.opacity(0.75))
                     .lineLimit(1)
+                    .truncationMode(.tail)
             }
-            Spacer(minLength: 0)
         }
         .padding(.horizontal, 6)
         .padding(.vertical, 3)
-        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
         .background(
             RoundedRectangle(cornerRadius: 5, style: .continuous)
                 .fill(color.opacity(0.85))
         )
-        // `strokeBorder` keeps the stroke INSIDE the frame so adjoining blocks don't visually overlap
-        // (default `stroke` paints centered on the edge, half outside the frame).
         .overlay(
             RoundedRectangle(cornerRadius: 5, style: .continuous)
                 .strokeBorder(color, lineWidth: 1)
         )
+        .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
     }
 
     private var timeRange: String {
