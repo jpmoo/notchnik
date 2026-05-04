@@ -165,7 +165,23 @@ final class AppSettingsStore: ObservableObject {
         static let appCategoriesRevision = "NotchNik.appCategoriesRevision"
         static let domainCategories = "NotchNik.domainCategories"
         static let appliedSeedVersion = "NotchNik.appliedSeedCategoryVersion"
+        static let nonCountingCategories = "NotchNik.nonCountingCategories"
     }
+
+    /// Recognized categories the AI guess pass and conversational categorizer use, plus a
+    /// few extras that show up naturally. Not exhaustive — users can name a category
+    /// anything they want — but this is the master list shown in Settings → Insights.
+    static let recognizedCategories: [String] = [
+        "coding", "writing", "design", "research", "comms", "admin", "ai",
+        "social", "entertainment", "games"
+    ]
+
+    /// Defaults: which recognized categories DON'T count toward focus. Stored as a Set<String>
+    /// rather than per-category flags because most users will keep the defaults; persisting
+    /// only the negative cases keeps user config minimal.
+    static let defaultNonCountingCategories: Set<String> = [
+        "social", "entertainment", "games"
+    ]
 
     /// Bumped whenever the seed tables below are extended. On launch we apply seeds for any
     /// key the user hasn't already categorized, then persist the new version. Existing users
@@ -388,6 +404,28 @@ final class AppSettingsStore: ObservableObject {
         }
     }
 
+    /// Categories whose time does NOT count as "active" for scoring purposes. Time spent on
+    /// apps/sites in these categories is tracked in the activity log and shows in topApps,
+    /// but is excluded from the active-time total used for the threshold check, presence
+    /// multiplier, and baseline streak math. Default: social, entertainment, games. User can
+    /// flip any recognized category via Settings → Insights → Category counting.
+    @Published private(set) var nonCountingCategories: Set<String> {
+        didSet {
+            let arr = Array(nonCountingCategories)
+            UserDefaults.standard.set(arr, forKey: Keys.nonCountingCategories)
+            // Score math depends on this set, so bump revision so existing entries get
+            // re-rated next time the user opens the panel.
+            appCategoriesRevision &+= 1
+        }
+    }
+
+    /// Convenience: does the named category currently count toward active time? Empty/nil
+    /// category gives benefit of doubt (counts).
+    func categoryCountsTowardActive(_ category: String?) -> Bool {
+        guard let category, !category.isEmpty else { return true }
+        return !nonCountingCategories.contains(category.lowercased())
+    }
+
     /// Reflects `SMAppService.mainApp` registration; not persisted as source of truth.
     @Published private(set) var startAtLogin: Bool
 
@@ -452,6 +490,12 @@ final class AppSettingsStore: ObservableObject {
             domainCategories = stored
         } else {
             domainCategories = [:]
+        }
+
+        if let stored = defaults.array(forKey: Keys.nonCountingCategories) as? [String] {
+            nonCountingCategories = Set(stored.map { $0.lowercased() })
+        } else {
+            nonCountingCategories = Self.defaultNonCountingCategories
         }
 
         startAtLogin = LoginItemRegistration.isEnabled
@@ -545,6 +589,30 @@ final class AppSettingsStore: ObservableObject {
         copy.removeValue(forKey: key)
         appCategoriesRevision &+= 1
         domainCategories = copy
+    }
+
+    /// Toggle whether the named category counts toward active time. The change ripples
+    /// through scoring (threshold, presence, streak math) and the prompt's category context.
+    func setCategoryCountsTowardActive(_ category: String, counts: Bool) {
+        let key = category.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !key.isEmpty else { return }
+        var copy = nonCountingCategories
+        if counts {
+            copy.remove(key)
+        } else {
+            copy.insert(key)
+        }
+        nonCountingCategories = copy
+    }
+
+    /// Master list of categories the user might have in play: the recognized defaults plus any
+    /// categories actually assigned to apps or domains (so user-coined categories show up too).
+    /// Sorted alphabetically; lowercase.
+    var allKnownCategories: [String] {
+        var set = Set(Self.recognizedCategories)
+        for value in appCategories.values { set.insert(value.lowercased()) }
+        for value in domainCategories.values { set.insert(value.lowercased()) }
+        return set.sorted()
     }
 
     /// Returns visible sections in the user's chosen display order. Carousel + navigation use this.

@@ -713,11 +713,8 @@ private struct InsightsSettingsTab: View {
                 UncategorizedItems()
                     .padding(.top, 4)
 
-                AppCategoriesEditor()
-                    .padding(.top, 4)
-
-                DomainCategoriesEditor()
-                    .padding(.top, 4)
+                CategoryEditorButtons()
+                    .padding(.top, 8)
 
                 HistoryMaintenance()
                     .padding(.top, 8)
@@ -1238,6 +1235,355 @@ private struct UncategorizedRow: View {
         onCommit(trimmed)
         editing = false
         draft = ""
+    }
+}
+
+/// Three buttons that open category-management modal windows. Mirrors the activity-log
+/// pattern — keeps the Settings tab scannable while putting full search + scroll editors
+/// behind dedicated windows.
+private struct CategoryEditorButtons: View {
+    @State private var showingApps = false
+    @State private var showingDomains = false
+    @State private var showingCategories = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Categories")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                Button("App categories…") { showingApps = true }
+                Button("Domain categories…") { showingDomains = true }
+                Button("Category counting…") { showingCategories = true }
+                Spacer()
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .sheet(isPresented: $showingApps) { AppCategoriesWindow() }
+        .sheet(isPresented: $showingDomains) { DomainCategoriesWindow() }
+        .sheet(isPresented: $showingCategories) { CategoryCountingWindow() }
+    }
+}
+
+/// Modal window listing app → category mappings. Mirrors `ActivityLogView`'s shape: header
+/// with title + count, scrollable body with search, footer with Done.
+private struct AppCategoriesWindow: View {
+    @EnvironmentObject private var settings: AppSettingsStore
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var search: String = ""
+    @State private var pendingAddBundleID: String?
+    @State private var pendingAddDisplayName: String?
+
+    private var allRows: [(bundleID: String, category: String)] {
+        settings.appCategories
+            .map { ($0.key, $0.value) }
+            .sorted { $0.0 < $1.0 }
+    }
+
+    private var filteredRows: [(bundleID: String, category: String)] {
+        guard !search.isEmpty else { return allRows }
+        let q = search.lowercased()
+        return allRows.filter { $0.bundleID.lowercased().contains(q) || $0.category.lowercased().contains(q) }
+    }
+
+    private var addableRunningApps: [(bundleID: String, name: String)] {
+        NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular }
+            .compactMap { app -> (bundleID: String, name: String)? in
+                guard let bid = app.bundleIdentifier, !bid.isEmpty else { return nil }
+                if AppSettingsStore.isIgnoredBundleID(bid) { return nil }
+                if settings.appCategories[bid] != nil { return nil }
+                return (bid, app.localizedName ?? bid)
+            }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("App Categories").font(.headline)
+                Spacer()
+                Text("\(allRows.count)")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 16).padding(.top, 14).padding(.bottom, 8)
+            Divider()
+
+            VStack(spacing: 8) {
+                HStack(spacing: 8) {
+                    TextField("Search apps or categories", text: $search)
+                        .textFieldStyle(.roundedBorder)
+                    Menu {
+                        let candidates = addableRunningApps
+                        if candidates.isEmpty {
+                            Text("No running apps left to add.")
+                        } else {
+                            ForEach(candidates, id: \.bundleID) { app in
+                                Button("\(app.name)  —  \(app.bundleID)") {
+                                    pendingAddBundleID = app.bundleID
+                                    pendingAddDisplayName = app.name
+                                }
+                            }
+                        }
+                    } label: {
+                        Label("Add app", systemImage: "plus.circle")
+                    }
+                    .fixedSize()
+                }
+                if let bundleID = pendingAddBundleID, let name = pendingAddDisplayName {
+                    NewCategoryDraftRow(label: name, sublabel: bundleID) { category in
+                        settings.setAppCategory(bundleID: bundleID, category: category)
+                        pendingAddBundleID = nil; pendingAddDisplayName = nil
+                    } onCancel: {
+                        pendingAddBundleID = nil; pendingAddDisplayName = nil
+                    }
+                }
+            }
+            .padding(.horizontal, 16).padding(.top, 10).padding(.bottom, 8)
+
+            if filteredRows.isEmpty {
+                VStack(spacing: 6) {
+                    Image(systemName: "tray")
+                        .font(.system(size: 28, weight: .light))
+                        .foregroundStyle(.secondary)
+                    Text(allRows.isEmpty ? "No app categories yet." : "No matches.")
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List {
+                    ForEach(filteredRows, id: \.bundleID) { row in
+                        AppCategoryRow(bundleID: row.bundleID, category: row.category)
+                    }
+                }
+                .listStyle(.inset)
+            }
+
+            Divider()
+            HStack {
+                Spacer()
+                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
+            }
+            .padding(.horizontal, 16).padding(.vertical, 10)
+        }
+        .frame(width: 600, height: 480)
+    }
+}
+
+/// Modal window for domain → category mappings. Same pattern as AppCategoriesWindow.
+private struct DomainCategoriesWindow: View {
+    @EnvironmentObject private var settings: AppSettingsStore
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var search: String = ""
+    @State private var pendingAddHost: String?
+    @State private var pendingAddTitle: String?
+
+    private var allRows: [(host: String, category: String)] {
+        settings.domainCategories
+            .map { ($0.key, $0.value) }
+            .sorted { $0.0 < $1.0 }
+    }
+
+    private var filteredRows: [(host: String, category: String)] {
+        guard !search.isEmpty else { return allRows }
+        let q = search.lowercased()
+        return allRows.filter { $0.host.lowercased().contains(q) || $0.category.lowercased().contains(q) }
+    }
+
+    private var addableOpenTabs: [(host: String, title: String)] {
+        let supported = Set(BrowserContextFetcher.supportedBundleIDs)
+        let runningBrowsers = NSWorkspace.shared.runningApplications
+            .compactMap { $0.bundleIdentifier }
+            .filter { supported.contains($0) }
+        var seen: Set<String> = []
+        var results: [(host: String, title: String)] = []
+        for bid in runningBrowsers {
+            guard let context = BrowserContextFetcher.fetch(bundleID: bid),
+                  let url = context.url,
+                  let host = extractHost(from: url) else { continue }
+            if settings.domainCategories[host] != nil { continue }
+            if seen.contains(host) { continue }
+            seen.insert(host)
+            results.append((host: host, title: context.title ?? host))
+        }
+        return results.sorted { $0.host < $1.host }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Domain Categories").font(.headline)
+                Spacer()
+                Text("\(allRows.count)")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 16).padding(.top, 14).padding(.bottom, 8)
+            Divider()
+
+            VStack(spacing: 8) {
+                HStack(spacing: 8) {
+                    TextField("Search domains or categories", text: $search)
+                        .textFieldStyle(.roundedBorder)
+                    Menu {
+                        let candidates = addableOpenTabs
+                        if candidates.isEmpty {
+                            Text("No open tabs left to add.")
+                        } else {
+                            ForEach(candidates, id: \.host) { tab in
+                                Button("\(tab.host)  —  \(tab.title)") {
+                                    pendingAddHost = tab.host
+                                    pendingAddTitle = tab.title
+                                }
+                            }
+                        }
+                    } label: {
+                        Label("Add from open tab", systemImage: "plus.circle")
+                    }
+                    .fixedSize()
+                }
+                if let host = pendingAddHost {
+                    NewCategoryDraftRow(label: host, sublabel: pendingAddTitle) { category in
+                        settings.setDomainCategory(host: host, category: category)
+                        pendingAddHost = nil; pendingAddTitle = nil
+                    } onCancel: {
+                        pendingAddHost = nil; pendingAddTitle = nil
+                    }
+                }
+            }
+            .padding(.horizontal, 16).padding(.top, 10).padding(.bottom, 8)
+
+            if filteredRows.isEmpty {
+                VStack(spacing: 6) {
+                    Image(systemName: "tray")
+                        .font(.system(size: 28, weight: .light))
+                        .foregroundStyle(.secondary)
+                    Text(allRows.isEmpty ? "No domain categories yet." : "No matches.")
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List {
+                    ForEach(filteredRows, id: \.host) { row in
+                        DomainCategoryRow(host: row.host, category: row.category)
+                    }
+                }
+                .listStyle(.inset)
+            }
+
+            Divider()
+            HStack {
+                Spacer()
+                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
+            }
+            .padding(.horizontal, 16).padding(.vertical, 10)
+        }
+        .frame(width: 600, height: 480)
+    }
+}
+
+/// Modal window listing every recognized category plus any user-coined ones, with a toggle
+/// per category for whether time in that category counts toward active time. Drives the
+/// scoring threshold/presence/streak math via `AppSettingsStore.nonCountingCategories`.
+private struct CategoryCountingWindow: View {
+    @EnvironmentObject private var settings: AppSettingsStore
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var search: String = ""
+
+    private var allCategories: [String] {
+        settings.allKnownCategories
+    }
+
+    private var filteredCategories: [String] {
+        guard !search.isEmpty else { return allCategories }
+        let q = search.lowercased()
+        return allCategories.filter { $0.contains(q) }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Category Counting").font(.headline)
+                Spacer()
+                Text("\(allCategories.count)")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 16).padding(.top, 14).padding(.bottom, 8)
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Categories with the toggle ON count time toward the focus score's active total. Categories with the toggle OFF still appear in topApps and the activity log, but their time doesn't count toward the score.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                TextField("Search categories", text: $search)
+                    .textFieldStyle(.roundedBorder)
+            }
+            .padding(.horizontal, 16).padding(.top, 10).padding(.bottom, 8)
+
+            if filteredCategories.isEmpty {
+                Text("No matches.")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List {
+                    ForEach(filteredCategories, id: \.self) { cat in
+                        CategoryCountingRow(category: cat)
+                    }
+                }
+                .listStyle(.inset)
+            }
+
+            Divider()
+            HStack {
+                Spacer()
+                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
+            }
+            .padding(.horizontal, 16).padding(.vertical, 10)
+        }
+        .frame(width: 480, height: 480)
+    }
+}
+
+private struct CategoryCountingRow: View {
+    @EnvironmentObject private var settings: AppSettingsStore
+    let category: String
+
+    private var counts: Bool {
+        settings.categoryCountsTowardActive(category)
+    }
+
+    var body: some View {
+        Toggle(isOn: Binding(
+            get: { counts },
+            set: { settings.setCategoryCountsTowardActive(category, counts: $0) }
+        )) {
+            HStack(spacing: 6) {
+                Text(category)
+                    .font(.system(size: 12, weight: .medium))
+                if AppSettingsStore.recognizedCategories.contains(category) {
+                    Text("default")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Capsule().fill(Color.secondary.opacity(0.15)))
+                } else {
+                    Text("custom")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Capsule().fill(Color.accentColor.opacity(0.15)))
+                }
+            }
+        }
+        .toggleStyle(.switch)
     }
 }
 

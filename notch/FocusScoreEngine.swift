@@ -87,7 +87,7 @@ final class FocusScoreEngine: ObservableObject {
     /// (loginwindow filtering, idle accounting, the 10-min threshold, the presence-multiplier
     /// baseline, calendar-as-primary-context prompt, host/app-level streaks, etc.). Entries
     /// persisted with a lower stamp get auto-recomputed at launch by `autoRefreshOutdatedScores`.
-    static let currentScoringVersion: Int = 7
+    static let currentScoringVersion: Int = 8
     /// Apps with at least this much time in the window are eligible to be queried for a category.
     private let categorizationMinSeconds: TimeInterval = 5 * 60
     /// Minimum ACTIVE time (idle subtracted) required for an hour to be scored. Switching from
@@ -298,6 +298,7 @@ final class FocusScoreEngine: ObservableObject {
         }.joined(separator: "\n")
 
         let activeMin = Int(summary.totalSeconds / 60)
+        let nonCountingMin = Int(summary.nonCountingActiveSeconds / 60)
         let idleMin = Int(summary.idleSeconds / 60)
         let userPrompt = """
         Compute a focus score for the last hour of the user's desktop activity.
@@ -306,7 +307,8 @@ final class FocusScoreEngine: ObservableObject {
         - Longest unbroken active streak on one app or website: \(Int(summary.longestStreakSeconds / 60)) min
         - Total context switches: \(summary.switches)
         - Distinct contexts (app+window+tab): \(summary.distinctContexts)
-        - Active time (idle subtracted): \(activeMin) min
+        - Active time (idle subtracted, counting categories only): \(activeMin) min
+        - Active time on NON-counting categories (social/entertainment/games, by user setting): \(nonCountingMin) min
         - Idle time (AFK — no input): \(idleMin) min
         - Heuristic baseline score (0-100): \(baseline)
 
@@ -724,6 +726,7 @@ final class FocusScoreEngine: ObservableObject {
         let windowStart: Date
         let windowEnd: Date
         let activeMinutes: Int
+        let nonCountingActiveMinutes: Int
         let idleMinutes: Int
         let wallMinutes: Int
         let longestStreakMinutes: Int
@@ -754,14 +757,15 @@ final class FocusScoreEngine: ObservableObject {
         let summary = settings.map {
             WindowSummary.build(events: events, start: windowStart, end: windowEnd, settings: $0, calendarEvents: calendar?.events ?? [])
         } ?? WindowSummary(
-            totalSeconds: 0, idleSeconds: 0,
+            totalSeconds: 0, nonCountingActiveSeconds: 0, idleSeconds: 0,
             windowSeconds: windowEnd.timeIntervalSince(windowStart),
             longestStreakSeconds: 0,
             switches: 0, distinctContexts: 0, appTotals: [], hostTotals: []
         )
         let activeMin = Int(summary.totalSeconds / 60)
+        let nonCountingMin = Int(summary.nonCountingActiveSeconds / 60)
         let idleMin = Int(summary.idleSeconds / 60)
-        let wallMin = activeMin + idleMin
+        let wallMin = activeMin + nonCountingMin + idleMin
         // Reuse the same topApps resolution as scored entries so apps + domains + categories
         // come out consistently. Empty when settings is nil (no AppSettingsStore available).
         let topApps: [FocusScore.TopApp] = settings.map { summary.topApps(in: $0) } ?? []
@@ -794,6 +798,7 @@ final class FocusScoreEngine: ObservableObject {
             windowStart: windowStart,
             windowEnd: windowEnd,
             activeMinutes: activeMin,
+            nonCountingActiveMinutes: nonCountingMin,
             idleMinutes: idleMin,
             wallMinutes: wallMin,
             longestStreakMinutes: Int(summary.longestStreakSeconds / 60),
@@ -1158,9 +1163,14 @@ struct WindowSummary {
         let seconds: TimeInterval
     }
 
-    /// Active time only — idle has already been subtracted. This is the right denominator for
-    /// "how engaged were they?" calculations.
+    /// Active time in COUNTING categories only — idle subtracted, and time spent in non-
+    /// counting categories (social, entertainment, games by default) excluded entirely.
+    /// This is the value used for the threshold check, presence multiplier, and baseline
+    /// streak math. Per the user's settings — they can flip any recognized category.
     let totalSeconds: TimeInterval
+    /// Active time in non-counting categories — tracked separately so the diagnostic readout
+    /// can show "you spent 30 min on entertainment, but the score doesn't credit it."
+    let nonCountingActiveSeconds: TimeInterval
     /// Estimated AFK seconds inside the window. Surfaced separately so the prompt can mention it
     /// (so the model can correlate it with calendar context — e.g. idle during a meeting block).
     let idleSeconds: TimeInterval
@@ -1184,10 +1194,7 @@ struct WindowSummary {
     /// stretches don't pad streaks or app totals. The wall-clock total stays available too for any
     /// caller that wants to know how much real time the window covers.
     /// Returns true for events that should never count toward focus — currently any flavor of
-    /// `loginwindow` (lock screen, login screen, fast-user-switching). Belt-and-suspenders
-    /// against old persisted events that slipped in before we added the capture-time filter,
-    /// or future macOS variants where loginwindow ships as a sub-bundle. Case-insensitive on
-    /// both bundleID and the localized appName.
+    /// `loginwindow` (lock screen, login screen, fast-user-switching).
     static func isIgnoredEvent(_ event: ActivityWatcher.Event) -> Bool {
         if let id = event.bundleID?.lowercased(), id.hasPrefix("com.apple.loginwindow") {
             return true
@@ -1198,12 +1205,24 @@ struct WindowSummary {
         return false
     }
 
+    /// Single source of truth for "what category does this event belong to?" Host wins for
+    /// browser events; falls back to the app's bundleID-based category. Lowercased.
+    static func resolvedCategory(forEvent event: ActivityWatcher.Event, settings: AppSettingsStore) -> String? {
+        if let url = event.tabURL, let host = extractHost(from: url),
+           let cat = settings.domainCategories[host], !cat.isEmpty {
+            return cat.lowercased()
+        }
+        if let bid = event.bundleID, let cat = settings.appCategories[bid], !cat.isEmpty {
+            return cat.lowercased()
+        }
+        return nil
+    }
+
     static func build(events: [ActivityWatcher.Event], start: Date, end: Date, settings: AppSettingsStore, calendarEvents: [CalendarEvent] = []) -> WindowSummary {
         let events = events.filter { !isIgnoredEvent($0) }
-        // Pre-filter calendar events to those overlapping this window — saves checking the
-        // full feed on every activity event below.
         let overlappingMeetings = calendarEvents.filter { $0.start < end && $0.end > start }
         var activeSeconds: TimeInterval = 0
+        var nonCountingActiveSeconds: TimeInterval = 0
         var idleSeconds: TimeInterval = 0
         var longestStreak: TimeInterval = 0
         var switches = 0
@@ -1247,15 +1266,25 @@ struct WindowSummary {
             // Calendar-aware idle credit: when the activity event overlaps a meeting on the
             // calendar, idle minutes inside it count as ACTIVE. The user is in the meeting
             // (Zoom listening, in-person presenting, taking notes) — the keyboard not moving
-            // doesn't mean unfocused. The previous behavior penalized meeting hours; this
-            // change makes the deterministic baseline honest about meetings BEFORE any AI
-            // nudge, so the AI doesn't have to fight the math.
+            // doesn't mean unfocused.
             let inMeeting = overlappingMeetings.contains { $0.start < clippedEnd && $0.end > clippedStart }
             let activeDuration: TimeInterval = inMeeting
                 ? wallDuration
                 : max(0, wallDuration - idleInWindow)
 
-            activeSeconds += activeDuration
+            // Resolve this event's category — host preferred for browsers, then app — and
+            // route active time to either the counting or non-counting bucket. Time on a
+            // non-counting category (default: social/entertainment/games) is excluded from
+            // the score's "active" total even though it's still tracked for display in
+            // topApps and the diagnostic readout. Calendar-credit overrides this: time during
+            // a meeting block always counts, regardless of app/host category.
+            let category = Self.resolvedCategory(forEvent: event, settings: settings)
+            let counts = inMeeting || settings.categoryCountsTowardActive(category)
+            if counts {
+                activeSeconds += activeDuration
+            } else {
+                nonCountingActiveSeconds += activeDuration
+            }
             idleSeconds += (wallDuration - activeDuration)
 
             // Streak key: host for browser-with-URL events, app for everything else. Same
@@ -1276,14 +1305,22 @@ struct WindowSummary {
                 gap = .infinity
             }
 
-            if streakKey == currentStreakKey, gap <= maxStreakGap {
+            // Non-counting events (social/entertainment/games etc.) break any active streak.
+            // A streak is "continuous focused work"; switching to Twitter for 5 minutes ends
+            // the streak even on the same browser host.
+            if !counts {
+                closeStreak()
+                currentStreakKey = nil
+                currentStreakEnd = clippedEnd
+            } else if streakKey == currentStreakKey, gap <= maxStreakGap {
                 currentStreakSeconds += activeDuration
+                currentStreakEnd = clippedEnd
             } else {
                 closeStreak()
                 currentStreakKey = streakKey
                 currentStreakSeconds = activeDuration
+                currentStreakEnd = clippedEnd
             }
-            currentStreakEnd = clippedEnd
 
             if activeDuration > 0 {
                 let contextKey = "\(event.appName)|\(event.windowTitle ?? "")|\(event.tabURL ?? "")"
@@ -1327,6 +1364,7 @@ struct WindowSummary {
         let hosts = hostBuckets.values.sorted { $0.seconds > $1.seconds }
         return WindowSummary(
             totalSeconds: activeSeconds,
+            nonCountingActiveSeconds: nonCountingActiveSeconds,
             idleSeconds: idleSeconds,
             windowSeconds: end.timeIntervalSince(start),
             longestStreakSeconds: longestStreak,

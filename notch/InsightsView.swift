@@ -1073,8 +1073,8 @@ private struct DaySection: View {
             // the values would be identical and the row would be visual noise.
             if let best = bestEntry, let worst = worstEntry, best.windowEnd != worst.windowEnd {
                 HStack(spacing: 8) {
-                    bestWorstHourChip(label: "Best hour", time: best.windowStart, score: best.value, color: .green)
-                    bestWorstHourChip(label: "Worst hour", time: worst.windowStart, score: worst.value, color: .red)
+                    bestWorstHourChip(label: "Best hour", time: best.windowStart, score: best.value)
+                    bestWorstHourChip(label: "Worst hour", time: worst.windowStart, score: worst.value)
                     Spacer()
                 }
             }
@@ -1136,7 +1136,10 @@ private struct DaySection: View {
     }
 
     @ViewBuilder
-    private func bestWorstHourChip(label: String, time: Date, score: Int, color: Color) -> some View {
+    private func bestWorstHourChip(label: String, time: Date, score: Int) -> some View {
+        // Color reflects the score itself, not the "best vs. worst" label. So a "best hour"
+        // of 55 reads as yellow rather than green-no-matter-what.
+        let color = scoreColor(score)
         HStack(spacing: 6) {
             Text(label)
                 .font(.system(size: 9, weight: .bold))
@@ -1150,7 +1153,7 @@ private struct DaySection: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
-        .background(Capsule().fill(color.opacity(0.12)))
+        .background(Capsule().fill(color.opacity(0.18)))
     }
 }
 
@@ -1200,7 +1203,10 @@ private struct HourStatsGrid: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            statRow(label: "Active time",       value: "\(diagnostic.activeMinutes) min", muted: false)
+            statRow(label: "Active time (counting)", value: "\(diagnostic.activeMinutes) min", muted: false)
+            if diagnostic.nonCountingActiveMinutes > 0 {
+                statRow(label: "Active time (non-counting)", value: "\(diagnostic.nonCountingActiveMinutes) min", muted: false)
+            }
             statRow(label: "Idle time",         value: "\(diagnostic.idleMinutes) min",   muted: false)
             statRow(label: "Wall time",         value: "\(diagnostic.wallMinutes) min",   muted: true)
             statRow(label: "Threshold",         value: "≥ \(diagnostic.thresholdMinActiveMinutes) min active", muted: true)
@@ -1491,8 +1497,8 @@ private struct WeekSection: View {
             // Best / worst day chips. Both clickable to drill into Day tab.
             if let pair = bestWorstDays {
                 HStack(spacing: 8) {
-                    bestWorstDayChip(label: "Best day", date: pair.best.date, score: pair.best.avg, color: .green)
-                    bestWorstDayChip(label: "Worst day", date: pair.worst.date, score: pair.worst.avg, color: .red)
+                    bestWorstDayChip(label: "Best day", date: pair.best.date, score: pair.best.avg)
+                    bestWorstDayChip(label: "Worst day", date: pair.worst.date, score: pair.worst.avg)
                     Spacer()
                 }
             }
@@ -1520,7 +1526,8 @@ private struct WeekSection: View {
     }()
 
     @ViewBuilder
-    private func bestWorstDayChip(label: String, date: Date, score: Int, color: Color) -> some View {
+    private func bestWorstDayChip(label: String, date: Date, score: Int) -> some View {
+        let color = scoreColor(score)
         Button {
             onPickDay(date)
         } label: {
@@ -1537,7 +1544,7 @@ private struct WeekSection: View {
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
-            .background(Capsule().fill(color.opacity(0.12)))
+            .background(Capsule().fill(color.opacity(0.18)))
         }
         .buttonStyle(.plain)
         .help("Jump to this day in the Day tab")
@@ -1729,8 +1736,8 @@ private struct MonthSection: View {
             // optional-tuple, not a chain of let-bindings the type checker dislikes.
             if let pair = bestWorstWeeks {
                 HStack(spacing: 8) {
-                    bestWorstWeekChip(label: "Best week", weekStart: pair.best.start, score: pair.best.avg, color: .green)
-                    bestWorstWeekChip(label: "Worst week", weekStart: pair.worst.start, score: pair.worst.avg, color: .red)
+                    bestWorstWeekChip(label: "Best week", weekStart: pair.best.start, score: pair.best.avg)
+                    bestWorstWeekChip(label: "Worst week", weekStart: pair.worst.start, score: pair.worst.avg)
                     Spacer()
                 }
             }
@@ -1818,9 +1825,10 @@ private struct MonthSection: View {
     }()
 
     @ViewBuilder
-    private func bestWorstWeekChip(label: String, weekStart: Date, score: Int, color: Color) -> some View {
+    private func bestWorstWeekChip(label: String, weekStart: Date, score: Int) -> some View {
         let weekEnd = calendar.date(byAdding: .day, value: 6, to: weekStart) ?? weekStart
         let text = "\(Self.weekChipFormatter.string(from: weekStart))–\(Self.weekChipFormatter.string(from: weekEnd))"
+        let color = scoreColor(score)
         Button {
             onPickWeek(weekStart)
         } label: {
@@ -1837,7 +1845,7 @@ private struct MonthSection: View {
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
-            .background(Capsule().fill(color.opacity(0.12)))
+            .background(Capsule().fill(color.opacity(0.18)))
         }
         .buttonStyle(.plain)
         .help("Jump to this week in the Week tab")
@@ -2073,10 +2081,10 @@ private struct StatsCard: View {
             if stats.bestUnit != nil || stats.worstUnit != nil {
                 HStack(spacing: 8) {
                     if let best = stats.bestUnit {
-                        bestWorstPill(label: "Best \(stats.granularity.label)", text: best.label, avg: best.avg, color: .green)
+                        bestWorstPill(label: "Best \(stats.granularity.label)", text: best.label, avg: best.avg)
                     }
                     if let worst = stats.worstUnit {
-                        bestWorstPill(label: "Worst \(stats.granularity.label)", text: worst.label, avg: worst.avg, color: .red)
+                        bestWorstPill(label: "Worst \(stats.granularity.label)", text: worst.label, avg: worst.avg)
                     }
                     Spacer()
                 }
@@ -2151,7 +2159,8 @@ private struct StatsCard: View {
     }
 
     @ViewBuilder
-    private func bestWorstPill(label: String, text: String, avg: Int, color: Color) -> some View {
+    private func bestWorstPill(label: String, text: String, avg: Int) -> some View {
+        let color = scoreColor(avg)
         HStack(spacing: 6) {
             Text(label)
                 .font(.system(size: 9, weight: .bold))
