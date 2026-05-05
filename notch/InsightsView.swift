@@ -997,7 +997,10 @@ private struct DaySection: View {
     private var entriesByHour: [Int: FocusScore] {
         var map: [Int: FocusScore] = [:]
         for entry in entries {
-            let h = Calendar.current.component(.hour, from: entry.windowEnd)
+            // Position by windowStart hour so the bar under the "6 PM" axis label IS the
+            // entry covering 6–7 PM (windowStart 18). Was previously keyed by windowEnd hour
+            // which put each entry one column further right than the user's mental model.
+            let h = Calendar.current.component(.hour, from: entry.windowStart)
             map[h] = entry
         }
         return map
@@ -1129,7 +1132,7 @@ private struct DaySection: View {
     /// detail panel isn't empty. Defaults to nil if the day has nothing.
     private func defaultSelectionForCurrentDate() {
         if let last = entries.last {
-            selectedHour = Calendar.current.component(.hour, from: last.windowEnd)
+            selectedHour = Calendar.current.component(.hour, from: last.windowStart)
         } else {
             selectedHour = nil
         }
@@ -1245,7 +1248,7 @@ private struct HourDetail: View {
     @EnvironmentObject private var focusEngine: FocusScoreEngine
 
     private var diagnostic: FocusScoreEngine.HourDiagnostic {
-        focusEngine.diagnose(date: entry.windowStart, hour: Calendar.current.component(.hour, from: entry.windowEnd))
+        focusEngine.diagnose(date: entry.windowStart, hour: Calendar.current.component(.hour, from: entry.windowStart))
     }
 
     var body: some View {
@@ -1265,6 +1268,15 @@ private struct HourDetail: View {
                         .padding(.horizontal, 5)
                         .padding(.vertical, 1)
                         .background(Capsule().fill(Color.orange.opacity(0.18)))
+                }
+                let endComps = Calendar.current.dateComponents([.minute, .second], from: entry.windowEnd)
+                if (endComps.minute ?? 0) != 0 || (endComps.second ?? 0) != 0 {
+                    Text("in progress")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.85))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Capsule().strokeBorder(Color.white.opacity(0.4), lineWidth: 1).background(Capsule().fill(Color.white.opacity(0.10))))
                 }
                 Spacer()
             }
@@ -1354,17 +1366,20 @@ private struct DayBarChart: View {
         let entry = entriesByHour[hour]
         let isSelected = selectedHour == hour
         let fillHeight: CGFloat = entry.map { max(2, CGFloat($0.value) / 100 * totalHeight) } ?? 0
-        // Idle ratio: minutes / 60 of the hour. Capped to [0, 1] in case clock skew or a slow
-        // tick produces a slightly-over-an-hour idle reading.
         let idleRatio: CGFloat = entry.flatMap { $0.idleMinutes }.map { min(1, max(0, CGFloat($0) / 60)) } ?? 0
         let idleHeight: CGFloat = idleRatio * totalHeight
+        // In-progress = the entry's windowEnd doesn't sit on a clock-hour boundary. Score
+        // updates each recompute as the hour fills in; bar gets a dashed border so the user
+        // sees that this number is still moving.
+        let isInProgress: Bool = {
+            guard let entry else { return false }
+            let comps = Calendar.current.dateComponents([.minute, .second], from: entry.windowEnd)
+            return (comps.minute ?? 0) != 0 || (comps.second ?? 0) != 0
+        }()
 
         ZStack(alignment: .bottom) {
-            // Background track — visible for empty hours so the chart reads as 24 slots, not gaps.
             RoundedRectangle(cornerRadius: 2, style: .continuous)
                 .fill(Color.white.opacity(0.05))
-            // Idle underlay: a faint gray fill from the bottom proportional to AFK ratio.
-            // Shown behind the score fill so the visible "active" portion stands out cleanly.
             if idleHeight > 0 {
                 RoundedRectangle(cornerRadius: 2, style: .continuous)
                     .fill(Color.white.opacity(0.15))
@@ -1372,13 +1387,18 @@ private struct DayBarChart: View {
             }
             if let entry, fillHeight > 0 {
                 RoundedRectangle(cornerRadius: 2, style: .continuous)
-                    .fill(scoreColor(entry.value).opacity(isSelected ? 1.0 : 0.8))
+                    // Slightly more transparent fill for in-progress bars so the dashed
+                    // border reads as "this is provisional."
+                    .fill(scoreColor(entry.value).opacity(isInProgress ? 0.55 : (isSelected ? 1.0 : 0.8)))
                     .frame(height: fillHeight)
             }
         }
         .overlay(
             RoundedRectangle(cornerRadius: 2, style: .continuous)
-                .strokeBorder(isSelected ? Color.white.opacity(0.85) : Color.clear, lineWidth: 1.5)
+                .strokeBorder(
+                    isSelected ? Color.white.opacity(0.85) : (isInProgress ? Color.white.opacity(0.55) : Color.clear),
+                    style: StrokeStyle(lineWidth: 1.5, dash: isInProgress && !isSelected ? [3, 2] : [])
+                )
         )
         .contentShape(Rectangle())
         .onTapGesture {
@@ -1394,10 +1414,15 @@ private struct DayBarChart: View {
         let label = formatHour12(hour)
         guard let entry else { return "\(label) — no data" }
         let stem = "\(label) — focus \(entry.value)"
+        var suffix = ""
         if let idle = entry.idleMinutes, idle > 0 {
-            return stem + " (idle \(idle)m)"
+            suffix += " (idle \(idle)m)"
         }
-        return stem
+        let comps = Calendar.current.dateComponents([.minute, .second], from: entry.windowEnd)
+        if (comps.minute ?? 0) != 0 || (comps.second ?? 0) != 0 {
+            suffix += " · in progress"
+        }
+        return stem + suffix
     }
 }
 

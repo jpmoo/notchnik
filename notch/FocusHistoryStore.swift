@@ -46,14 +46,16 @@ final class FocusHistoryStore: ObservableObject {
 
     // MARK: - Public API
 
-    /// Append-or-replace a score by its hour-of-day. Hour key is local-tz, so a 14:00–15:00
-    /// window-end becomes hour 15. Two computes inside the same hour-of-day collapse to the
-    /// most recent (last write wins).
+    /// Append-or-replace a score by its hour-of-day, keyed by `windowStart` hour. So an entry
+    /// covering 6:00–7:00 PM has key 18 — matching the natural "this is the 6 PM hour" mental
+    /// model. (Previously keyed by `windowEnd` hour, which put the 6–7 PM entry at key 19,
+    /// causing a perceived off-by-one in the bar chart.) Two computes for the same clock hour
+    /// collapse to the most recent.
     func record(_ score: FocusScore) {
-        let key = dayKey(for: score.windowEnd)
+        let key = dayKey(for: score.windowStart)
         var entries = loadEntries(forDayKey: key)
-        let hour = calendar.component(.hour, from: score.windowEnd)
-        if let idx = entries.firstIndex(where: { calendar.component(.hour, from: $0.windowEnd) == hour }) {
+        let hour = calendar.component(.hour, from: score.windowStart)
+        if let idx = entries.firstIndex(where: { calendar.component(.hour, from: $0.windowStart) == hour }) {
             entries[idx] = score
         } else {
             entries.append(score)
@@ -179,7 +181,8 @@ final class FocusHistoryStore: ObservableObject {
         let key = dayKey(for: date)
         var entries = loadEntries(forDayKey: key)
         let originalCount = entries.count
-        entries.removeAll { calendar.component(.hour, from: $0.windowEnd) == hour }
+        // Match by windowStart hour for consistency with `record(_:)` keying.
+        entries.removeAll { calendar.component(.hour, from: $0.windowStart) == hour }
         guard entries.count != originalCount else { return }
         if entries.isEmpty {
             // Strip the now-empty day file rather than leaving a `[]` shell behind.
@@ -280,7 +283,8 @@ final class FocusHistoryStore: ObservableObject {
             }
             let entryIdle = entry.idleMinutes ?? 0
             idleTotal += entryIdle
-            let h = cal.component(.hour, from: entry.windowEnd)
+            // Hour-of-day for stats grouping uses windowStart, matching record/display.
+            let h = cal.component(.hour, from: entry.windowStart)
             byHourScores[h, default: []].append(entry.value)
             byHourActiveMin[h, default: []].append(entryActive)
             byHourIdleMin[h, default: []].append(entryIdle)
@@ -435,7 +439,19 @@ final class FocusHistoryStore: ObservableObject {
             copy.topApps = filtered
             return copy
         }
-        return cleaned
+        // Drop entries whose windowStart isn't on a clock-hour boundary — leftovers from the
+        // rolling-60-minute-window era. The new live path always writes hour-aligned windows;
+        // any unaligned entry is by definition stale and will get re-created on the next
+        // backfill / pill click using the current alignment policy.
+        let aligned = cleaned.filter { entry in
+            let comps = calendar.dateComponents([.minute, .second], from: entry.windowStart)
+            return comps.minute == 0 && comps.second == 0
+        }
+        if aligned.count != cleaned.count {
+            // Resave the trimmed list so we don't reload the misaligned entries each launch.
+            save(entries: aligned, dayKey: key)
+        }
+        return aligned
     }
 
     private func save(entries: [FocusScore], dayKey: String) {

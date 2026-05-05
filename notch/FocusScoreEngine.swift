@@ -171,30 +171,50 @@ final class FocusScoreEngine: ObservableObject {
 
     // MARK: - Recompute
 
-    /// Builds the per-window summary, derives a baseline score, asks the model to refine it
-    /// into a score + voice-matched commentary, and stores the result. Also queues a
-    /// categorization question if any apps in the window are uncategorized.
+    /// Scores both the just-completed clock hour AND the in-progress hour. The completed-hour
+    /// entry is final; the in-progress entry is a partial-window score that gets overwritten
+    /// each time recompute fires (and finalized into a complete-hour entry when the next clock
+    /// hour rolls around). Backfill, categorization, and the cached-insight invalidation run
+    /// once after both writes.
     func recomputeNow() async {
         guard let activity, let settings else { return }
         guard !isComputing else { return }
         isComputing = true
         defer { isComputing = false }
 
+        let cal = Calendar.current
         let now = Date()
-        let windowStart = now.addingTimeInterval(-windowDuration)
-        let summary = WindowSummary.build(events: activity.events, start: windowStart, end: now, settings: settings, calendarEvents: calendar?.events ?? [])
+        guard let currentHourStart = cal.date(bySettingHour: cal.component(.hour, from: now), minute: 0, second: 0, of: now),
+              let prevHourStart = cal.date(byAdding: .hour, value: -1, to: currentHourStart) else { return }
 
-        // Skip empty / quick-check-in hours: at least 10 min of ACTIVE engagement (idle
-        // subtracted). An idle-heavy hour fails this even when wall time is large.
+        // Score the just-completed clock hour first. Re-scoring the same hour on subsequent
+        // calls is fine — record() last-write-wins keys by windowStart hour.
+        await scoreWindow(start: prevHourStart, end: currentHourStart, settings: settings, activity: activity)
+
+        // Then the in-progress hour, if there's anything to score yet. The window grows as
+        // the hour proceeds; each recompute yields a fresher partial score.
+        if now > currentHourStart {
+            await scoreWindow(start: currentHourStart, end: now, settings: settings, activity: activity)
+        }
+
+        // Single shared post-processing for both windows.
+        backfillMissingHours()
+        rangeInsights.removeAll()
+    }
+
+    /// Builds + persists a focus score for an arbitrary window. Used by `recomputeNow` for the
+    /// completed-hour and in-progress-hour passes. Returns silently when active time is below
+    /// the threshold so partial-hour windows don't get spurious low scores during the first
+    /// few minutes.
+    private func scoreWindow(start windowStart: Date, end windowEnd: Date, settings: AppSettingsStore, activity: ActivityWatcher) async {
+        let summary = WindowSummary.build(events: activity.events, start: windowStart, end: windowEnd, settings: settings, calendarEvents: calendar?.events ?? [])
         guard summary.totalSeconds >= minScoredActiveSeconds else { return }
 
-        // Always compute a deterministic baseline so we have something even if Ollama is down.
         let baseline = baselineScore(from: summary)
-
         var finalScore = baseline
         var commentary = defaultCommentary(for: summary, score: baseline)
 
-        let calendarContext = calendar.map { CalendarSummaryFormatter.describe(events: $0.events, windowStart: windowStart, windowEnd: now) } ?? ""
+        let calendarContext = calendar.map { CalendarSummaryFormatter.describe(events: $0.events, windowStart: windowStart, windowEnd: windowEnd) } ?? ""
 
         if !settings.ollamaModel.isEmpty {
             if let modelResult = await askModelForScore(summary: summary, baseline: baseline, calendarContext: calendarContext, settings: settings) {
@@ -206,7 +226,7 @@ final class FocusScoreEngine: ObservableObject {
         let score = FocusScore(
             value: finalScore,
             windowStart: windowStart,
-            windowEnd: now,
+            windowEnd: windowEnd,
             commentary: commentary,
             topApps: summary.topApps(in: settings),
             idleMinutes: Int(summary.idleSeconds / 60),
@@ -216,17 +236,9 @@ final class FocusScoreEngine: ObservableObject {
         current = score
         saveToDisk()
         history.record(score)
-        // Backfill in the same pass so gaps that have accumulated (machine asleep, app quit, etc.)
-        // get filled in alongside the live compute. Cheap — deterministic baseline only.
-        backfillMissingHours()
-        // Any cached range insight is now stale — its summary was computed against a smaller
-        // entry set. Clearing forces a fresh generation next time the user opens the panel and
-        // clicks "Generate insight."
-        rangeInsights.removeAll()
 
-        // After scoring, see if we have an unrecognized app worth asking about. Only do this
-        // when the user isn't already mid-conversation (don't barge into a thread) and we
-        // aren't already waiting on a previous question.
+        // Categorization opportunity (asks once per recompute pass; the function self-throttles
+        // when there's already a pending question).
         await maybeAskAboutUncategorizedApp(summary: summary, settings: settings)
     }
 
@@ -988,7 +1000,7 @@ final class FocusScoreEngine: ObservableObject {
                     // Within current log coverage but no events overlap — the events that
                     // produced this entry got filtered out (loginwindow) or otherwise removed.
                     // Delete it. Predates-coverage entries fall through unchanged.
-                    hoursToDelete.append((date: entry.windowStart, hour: cal.component(.hour, from: entry.windowEnd)))
+                    hoursToDelete.append((date: entry.windowStart, hour: cal.component(.hour, from: entry.windowStart)))
                 }
             }
             guard let nextDay = cal.date(byAdding: .day, value: 1, to: dayCursor) else { break }
@@ -1024,7 +1036,7 @@ final class FocusScoreEngine: ObservableObject {
                 // rather than rewriting it to a token-heavy near-zero. Same threshold as the
                 // live `recomputeNow` path uses, so live and rescore agree on what counts.
                 guard summary.totalSeconds >= self.minScoredActiveSeconds else {
-                    let hour = cal.component(.hour, from: window.end)
+                    let hour = cal.component(.hour, from: window.start)
                     self.history.deleteEntry(forDate: window.start, hour: hour)
                     continue
                 }
