@@ -713,17 +713,15 @@ private struct FocusScorePill: View {
     let isComputing: Bool
     let action: () -> Void
 
-    /// True when the persisted "current" score covers the user's current hour. If it does not
-    /// (e.g., the live tick skipped this hour because active time was below threshold, or the
-    /// app was asleep), the pill renders blank. The Now tab can still show the previous
-    /// score's content; we just don't pretend the pill represents *right now* when it doesn't.
+    /// True when the persisted "current" score is the in-progress entry for THIS hour
+    /// (windowStart aligns to the current clock hour). Just-completed-hour entries — whose
+    /// windowEnd equals the current hour's start — are NOT considered current; the pill
+    /// blanks out for them so it doesn't pretend the score represents "right now."
     private var isCurrentHour: Bool {
         guard let score else { return false }
         let cal = Calendar.current
         let nowHourStart = cal.date(bySettingHour: cal.component(.hour, from: Date()), minute: 0, second: 0, of: Date()) ?? Date()
-        // The score's windowEnd is the end of the hour it scored (e.g., 14:00 for the 13:00–14:00
-        // hour). If windowEnd >= the current hour's start, the score is fresh enough to display.
-        return score.windowEnd >= nowHourStart
+        return score.windowStart == nowHourStart
     }
 
     private var displayValue: String {

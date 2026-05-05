@@ -203,12 +203,17 @@ final class FocusScoreEngine: ObservableObject {
     }
 
     /// Builds + persists a focus score for an arbitrary window. Used by `recomputeNow` for the
-    /// completed-hour and in-progress-hour passes. Returns silently when active time is below
-    /// the threshold so partial-hour windows don't get spurious low scores during the first
-    /// few minutes.
+    /// completed-hour and in-progress-hour passes. Threshold differs by window type:
+    /// completed hours need ≥10 min active to score (avoids spurious entries for hours where
+    /// the user barely showed up); in-progress hours just need >0 active time so the pill /
+    /// chart always reflect the user's current state, even early in the hour.
     private func scoreWindow(start windowStart: Date, end windowEnd: Date, settings: AppSettingsStore, activity: ActivityWatcher) async {
         let summary = WindowSummary.build(events: activity.events, start: windowStart, end: windowEnd, settings: settings, calendarEvents: calendar?.events ?? [])
-        guard summary.totalSeconds >= minScoredActiveSeconds else { return }
+        let cal = Calendar.current
+        let endComps = cal.dateComponents([.minute, .second], from: windowEnd)
+        let isInProgress = (endComps.minute ?? 0) != 0 || (endComps.second ?? 0) != 0
+        let threshold: TimeInterval = isInProgress ? 1 : minScoredActiveSeconds
+        guard summary.totalSeconds >= threshold else { return }
 
         let baseline = baselineScore(from: summary)
         var finalScore = baseline
