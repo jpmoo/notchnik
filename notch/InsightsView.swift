@@ -827,7 +827,11 @@ struct FocusScoreDetailView: View {
             Group {
                 switch tab {
                 case .now:
-                    NowSection(score: score)
+                    // Read live `focusEngine.current` instead of the captured `score` so the
+                    // Now tab stays in sync with the pill and Day chart as in-progress
+                    // entries update mid-hour. The captured `score` parameter snapshots the
+                    // value at panel-open time and never refreshes.
+                    NowSection(score: focusEngine.current)
                 case .day:
                     DaySection(history: focusEngine.history, selectedDate: $selectedDate)
                 case .week:
