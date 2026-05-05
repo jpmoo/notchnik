@@ -202,18 +202,14 @@ final class FocusScoreEngine: ObservableObject {
         rangeInsights.removeAll()
     }
 
-    /// Builds + persists a focus score for an arbitrary window. Used by `recomputeNow` for the
-    /// completed-hour and in-progress-hour passes. Threshold differs by window type:
-    /// completed hours need ≥10 min active to score (avoids spurious entries for hours where
-    /// the user barely showed up); in-progress hours just need >0 active time so the pill /
-    /// chart always reflect the user's current state, even early in the hour.
+    /// Builds + persists a focus score for an arbitrary window. Same 10-min active-time
+    /// threshold for both completed and in-progress hours — keeps the bar for "meaningful
+    /// enough to score" consistent so the pill, Day chart, and AI commentary all agree on
+    /// what counts. The pill stays blank until 10 min of activity has accrued in the new
+    /// hour, then updates each recompute as the hour fills in.
     private func scoreWindow(start windowStart: Date, end windowEnd: Date, settings: AppSettingsStore, activity: ActivityWatcher) async {
         let summary = WindowSummary.build(events: activity.events, start: windowStart, end: windowEnd, settings: settings, calendarEvents: calendar?.events ?? [])
-        let cal = Calendar.current
-        let endComps = cal.dateComponents([.minute, .second], from: windowEnd)
-        let isInProgress = (endComps.minute ?? 0) != 0 || (endComps.second ?? 0) != 0
-        let threshold: TimeInterval = isInProgress ? 1 : minScoredActiveSeconds
-        guard summary.totalSeconds >= threshold else { return }
+        guard summary.totalSeconds >= minScoredActiveSeconds else { return }
 
         let baseline = baselineScore(from: summary)
         var finalScore = baseline
@@ -363,6 +359,12 @@ final class FocusScoreEngine: ObservableObject {
         The commentary must be under 240 characters, in the personality voice you've been given, \
         and grounded in the stats above. Don't invent activities not listed. Don't recycle phrasing \
         from your previous turns.
+
+        Numbers are literal. If active time is 5 minutes, do NOT say "an hour" or "all morning" \
+        or any duration not implied by the actual numbers. If the user spent 1 minute on Gmail, \
+        the commentary cannot say they spent "an hour" on it. Anchor any time references to the \
+        active-time and longest-streak numbers above; if you can't be specific, be brief instead \
+        of inventing scale.
         """
 
         let system = buildInsightsSystemPrompt(personality: settings.insightsPersonality)

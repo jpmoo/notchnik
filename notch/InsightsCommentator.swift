@@ -51,10 +51,18 @@ final class InsightsCommentator: ObservableObject {
         case skippedNoContext = "Skipped — no useful context"
         case skippedTransient = "Skipped — transient frontmost app"
         case skippedSameContext = "Skipped — same context as recent comment"
+        case skippedSleeping = "Skipped — system asleep / lid closed"
         case modelEmpty = "Model returned empty"
         case modelSentinel = "Model said -"
         case modelError = "Model errored"
     }
+
+    /// Tracks whether macOS reported a sleep event since launch. Flipped by NSWorkspace's
+    /// `willSleep` / `didWake` notifications. The lid closing (or any sleep trigger) sets
+    /// this true; wake clears it. Commentator skips while asleep so a forced timer tick
+    /// while the user is away from the machine doesn't fire — and so the AI can't write a
+    /// comment about whatever app was frontmost when they walked off.
+    private var isSleeping: Bool = false
 
     /// What was in focus when the commentator last produced a comment. Used to suppress
     /// repeat-observation comments when the user has been parked on the same thing for a
@@ -134,6 +142,16 @@ final class InsightsCommentator: ObservableObject {
                 Task { @MainActor in self?.handleContextChange(event) }
             }
             .store(in: &cancellables)
+
+        // Sleep / wake notifications. Lid close → willSleep → suppress ticks until didWake.
+        // Catches lid-close, system sleep timer, manually triggered sleep, etc.
+        let wsCenter = NSWorkspace.shared.notificationCenter
+        wsCenter.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.isSleeping = true }
+        }
+        wsCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.isSleeping = false }
+        }
     }
 
     private var cancellables: Set<AnyCancellable> = []
@@ -191,6 +209,14 @@ final class InsightsCommentator: ObservableObject {
     private func tick(forceFire: Bool = false) async {
         lastTickAt = Date()
         guard let chat, let settings, let activity, let calendar else { return }
+        // Sleeping / lid-closed: never fire commentary. The user isn't there to read it,
+        // and the AI would otherwise riff on whatever app happened to be frontmost when
+        // they walked away. Forced ticks (Settings → Comment now) bypass — the user is
+        // explicitly testing.
+        if isSleeping && !forceFire {
+            lastTickResult = .skippedSleeping
+            return
+        }
         guard !settings.ollamaModel.isEmpty else {
             lastTickResult = .skippedNoModel
             return
