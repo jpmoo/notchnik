@@ -32,15 +32,21 @@ extension String {
         let trimmed = self.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return trimmed }
 
-        // Leading bullet marker: "- foo" or "* foo" → "foo". Only strip when the line is a
-        // single bullet — multi-line bulleted content stays intact.
-        if !trimmed.contains("\n") {
-            if trimmed.hasPrefix("- ") {
-                return String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
+        // Leading bullet / heading / blockquote marker on a single-line reply: strip.
+        // Multi-line content: still strip a leading marker on the FIRST line only — we
+        // assume a model preface like "- " on its own first line is leakage even when the
+        // rest is multi-line. (Real markdown lists usually have content after the marker
+        // on the same line, which still gets handled correctly.)
+        let prefixesToStrip = ["- ", "* ", "# ", "## ", "### ", "> "]
+        for prefix in prefixesToStrip {
+            if trimmed.hasPrefix(prefix) {
+                let rest = String(trimmed.dropFirst(prefix.count))
+                return rest.trimmingCharacters(in: .whitespacesAndNewlines)
             }
-            if trimmed.hasPrefix("* ") {
-                return String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
-            }
+        }
+        // Lone bullet marker on its own line followed by content: "- \nrest" → "rest".
+        if trimmed.hasPrefix("-\n") || trimmed.hasPrefix("*\n") {
+            return String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
         }
 
         // Triple-backtick fence (with optional language tag): ```lang\nbody\n```

@@ -8,6 +8,7 @@
 //  transcript as assistant messages.
 //
 
+import AppKit
 import Combine
 import Foundation
 
@@ -145,12 +146,14 @@ final class InsightsCommentator: ObservableObject {
 
         // Sleep / wake notifications. Lid close → willSleep → suppress ticks until didWake.
         // Catches lid-close, system sleep timer, manually triggered sleep, etc.
+        // Inner Task re-captures self weakly to avoid the "captured var in concurrently-
+        // executing code" warning under Swift 6 strict concurrency.
         let wsCenter = NSWorkspace.shared.notificationCenter
         wsCenter.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.isSleeping = true }
+            Task { @MainActor [weak self] in self?.isSleeping = true }
         }
         wsCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.isSleeping = false }
+            Task { @MainActor [weak self] in self?.isSleeping = false }
         }
     }
 

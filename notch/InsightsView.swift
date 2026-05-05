@@ -284,9 +284,12 @@ final class InsightsChatStore: ObservableObject {
     /// Appends an assistant message that didn't come from a user prompt — used by the autonomous
     /// commentary engine. Shows up in the transcript like any other reply.
     func appendAssistant(_ text: String) {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        messages.append(OllamaClient.ChatMessage(role: .assistant, content: trimmed))
+        // Belt-and-suspenders normalize: strip surrounding quotes, leading bullet markers,
+        // and code fences here too. Most callers already do this, but applying at the
+        // storage boundary catches any path that forgot.
+        let cleaned = text.strippingSurroundingQuotes()
+        guard !cleaned.isEmpty else { return }
+        messages.append(OllamaClient.ChatMessage(role: .assistant, content: cleaned))
         trimToCap()
         saveToDisk()
     }
