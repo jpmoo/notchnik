@@ -1277,11 +1277,19 @@ private struct DaySection: View {
         selectedDate = next
     }
 
-    /// On date change (or first appear), pre-select the most recent hour with data so the
-    /// detail panel isn't empty. Defaults to nil if the day has nothing.
+    /// On date change (or first appear), pick which hour to start with.
+    /// - When viewing today: the CURRENT clock hour, regardless of whether it has a score
+    ///   yet. The diagnostic readout shows for that hour so the user can see what the engine
+    ///   is tracking right now (or "no score yet" if they haven't crossed the 10-min
+    ///   threshold).
+    /// - When viewing a past day: the most recent hour with data on that day.
+    /// - When viewing an empty past day: no selection.
     private func defaultSelectionForCurrentDate() {
-        if let last = entries.last {
-            selectedHour = Calendar.current.component(.hour, from: last.windowStart)
+        let cal = Calendar.current
+        if cal.isDateInToday(selectedDate) {
+            selectedHour = cal.component(.hour, from: Date())
+        } else if let last = entries.last {
+            selectedHour = cal.component(.hour, from: last.windowStart)
         } else {
             selectedHour = nil
         }
