@@ -197,7 +197,12 @@ final class FocusScoreEngine: ObservableObject {
             await scoreWindow(start: currentHourStart, end: now, settings: settings, activity: activity)
         }
 
-        // Single shared post-processing for both windows.
+        // Now sync `current` once, after both windows have been written. Pulling from the
+        // persisted history's mostRecentEntry guarantees we land on the in-progress entry
+        // (which has the later windowEnd) when one was eligible — and gracefully falls back
+        // to the just-completed entry when in-progress was below threshold.
+        refreshCurrentFromHistory()
+
         backfillMissingHours()
         rangeInsights.removeAll()
     }
@@ -234,8 +239,11 @@ final class FocusScoreEngine: ObservableObject {
             scoringVersion: Self.currentScoringVersion,
             categoriesRevision: settings.appCategoriesRevision
         )
-        current = score
-        saveToDisk()
+        // Persist the score to history but DON'T touch `current` here. recomputeNow scores
+        // two windows (completed + in-progress) back-to-back; if each scoreWindow updated
+        // `current` mid-flight, the UI would briefly flash the completed-hour value before
+        // settling on the in-progress one. recomputeNow itself sets `current` once at the
+        // end via refreshCurrentFromHistory() so observers see exactly one transition.
         history.record(score)
 
         // Categorization opportunity (asks once per recompute pass; the function self-throttles
@@ -367,7 +375,9 @@ final class FocusScoreEngine: ObservableObject {
         of inventing scale.
         """
 
-        let system = buildInsightsSystemPrompt(personality: settings.insightsPersonality)
+        // .minimal — JSON-extraction / question-phrasing paths don't want conversational
+        // rules layered on top.
+        let system = buildInsightsSystemPrompt(personality: settings.insightsPersonality, mode: .minimal)
         let payload: [OllamaClient.ChatMessage] = [
             OllamaClient.ChatMessage(role: .system, content: system),
             OllamaClient.ChatMessage(role: .user, content: userPrompt)
@@ -458,7 +468,9 @@ final class FocusScoreEngine: ObservableObject {
 
     private func phraseCategorizationQuestion(label: String, kind: PendingCategorization, settings: AppSettingsStore) async -> String? {
         guard !settings.ollamaModel.isEmpty else { return nil }
-        let system = buildInsightsSystemPrompt(personality: settings.insightsPersonality)
+        // .minimal — JSON-extraction / question-phrasing paths don't want conversational
+        // rules layered on top.
+        let system = buildInsightsSystemPrompt(personality: settings.insightsPersonality, mode: .minimal)
         let kindDescription: String
         switch kind {
         case .app: kindDescription = "the app"
@@ -593,7 +605,9 @@ final class FocusScoreEngine: ObservableObject {
         with a greeting. Don't recycle phrases from your previous turns.
         """
 
-        let system = buildInsightsSystemPrompt(personality: settings.insightsPersonality)
+        // .minimal — JSON-extraction / question-phrasing paths don't want conversational
+        // rules layered on top.
+        let system = buildInsightsSystemPrompt(personality: settings.insightsPersonality, mode: .minimal)
         let payload: [OllamaClient.ChatMessage] = [
             OllamaClient.ChatMessage(role: .system, content: system),
             OllamaClient.ChatMessage(role: .user, content: userPrompt)
@@ -781,13 +795,29 @@ final class FocusScoreEngine: ObservableObject {
             longestStreakSeconds: 0,
             switches: 0, distinctContexts: 0, appTotals: [], hostTotals: []
         )
-        let activeMin = Int(summary.totalSeconds / 60)
-        let nonCountingMin = Int(summary.nonCountingActiveSeconds / 60)
+        // Reuse the same topApps resolution as scored entries so apps + domains + categories
+        // come out consistently. Empty when settings is nil.
+        let topApps: [FocusScore.TopApp] = settings.map { summary.topApps(in: $0) } ?? []
+        // Display totals come from the SUM of per-row rounded-up minutes, not raw seconds —
+        // so two apps shown as "1 min" each total to "2 min" rather than the raw 60s
+        // rounding back to 1. Score math (threshold, presence) still uses the raw seconds
+        // via `summary.totalSeconds`; these values are display-only.
+        var activeMin = 0
+        var nonCountingMin = 0
+        if let s = settings {
+            for row in topApps {
+                if s.categoryCountsTowardActive(row.category) {
+                    activeMin += row.minutes
+                } else {
+                    nonCountingMin += row.minutes
+                }
+            }
+        } else {
+            activeMin = Int(summary.totalSeconds / 60)
+            nonCountingMin = Int(summary.nonCountingActiveSeconds / 60)
+        }
         let idleMin = Int(summary.idleSeconds / 60)
         let wallMin = activeMin + nonCountingMin + idleMin
-        // Reuse the same topApps resolution as scored entries so apps + domains + categories
-        // come out consistently. Empty when settings is nil (no AppSettingsStore available).
-        let topApps: [FocusScore.TopApp] = settings.map { summary.topApps(in: $0) } ?? []
         let thresholdMin = Int(minScoredActiveSeconds / 60)
         let willScore = summary.totalSeconds >= minScoredActiveSeconds
 
@@ -1396,31 +1426,34 @@ struct WindowSummary {
 
     /// Top entries as `FocusScore.TopApp` rows. For browser apps that produced any host data,
     /// the parent app row is replaced by per-host rows so the AI sees `gmail.com (25m)` and
-    /// `theonion.com (12m)` separately rather than one undifferentiated `Chrome` lump. Each
-    /// host's category is resolved against `settings.domainCategories` first, falling back to
-    /// the parent app's category if the host hasn't been categorized.
+    /// `theonion.com (12m)` separately rather than one undifferentiated `Chrome` lump.
+    ///
+    /// Any nonzero contribution rounds UP to 1 minute — entries that would otherwise display
+    /// as "0 min" are surfaced as "1 min" so the user sees they happened. Truly-zero entries
+    /// (no seconds at all) don't make it in.
     func topApps(in settings: AppSettingsStore) -> [FocusScore.TopApp] {
-        // Apps that contributed any host data — those get expanded into domain rows.
         let appsWithHosts = Set(hostTotals.map { $0.parentAppName })
 
         var rows: [FocusScore.TopApp] = []
 
         for app in appTotals where !appsWithHosts.contains(app.appName) {
+            guard app.seconds > 0 else { continue }
             rows.append(FocusScore.TopApp(
                 appName: app.appName,
                 bundleID: app.bundleID,
-                minutes: Int(app.seconds / 60),
+                minutes: max(1, Int(app.seconds / 60)),
                 category: app.bundleID.flatMap { settings.appCategories[$0] }
             ))
         }
 
         for host in hostTotals {
+            guard host.seconds > 0 else { continue }
             let resolvedCategory = settings.domainCategories[host.host]
                 ?? host.parentBundleID.flatMap { settings.appCategories[$0] }
             rows.append(FocusScore.TopApp(
                 appName: host.host,
                 bundleID: host.host,                          // reused as category-lookup key on display side
-                minutes: Int(host.seconds / 60),
+                minutes: max(1, Int(host.seconds / 60)),
                 category: resolvedCategory
             ))
         }

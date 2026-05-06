@@ -25,17 +25,133 @@ slide titled…") and never assume they are still on screen. If "Currently in fo
 missing, the user is between apps; don't fabricate what they're doing.
 """
 
-/// Builds the layered system prompt: identity → personality → optional observation context. The
-/// commentary engine passes a context string; interactive chat passes nil.
-func buildInsightsSystemPrompt(personality: InsightsPersonality, observationContext: String? = nil) -> String {
+/// What kind of model interaction we're prompting for. Used by `buildInsightsSystemPrompt` to
+/// add mode-specific framing on top of the shared rules.
+enum InsightsPromptMode {
+    /// Autonomous remark (commentator). Short, structurally varied, no greeting, may be silent.
+    case commentary
+    /// Conversational reply (user typed something). Engage with what they said, build on the
+    /// dialog, reference past topics, don't keep "observing."
+    case conversation
+    /// Score JSON / category extraction / question-phrasing — none of the conversational
+    /// rules apply. Caller passes its own user prompt; we just emit identity + personality.
+    case minimal
+}
+
+/// Returns the current date/time as a header line for the system prompt. Models often have no
+/// reliable sense of the user's current wall-clock time without this; also useful for the
+/// commentator's "today" filtering and the conversation's reasoning about timestamps in the
+/// chat history.
+private func currentDateTimeHeader() -> String {
+    let dateFmt = DateFormatter()
+    dateFmt.dateFormat = "EEEE, MMMM d, yyyy"
+    let timeFmt = DateFormatter()
+    timeFmt.dateFormat = "h:mm a"
+    let now = Date()
+    return "Current date: \(dateFmt.string(from: now)). Current time: \(timeFmt.string(from: now))."
+}
+
+/// Universal rules layered into every conversational + commentary prompt. Pulled out as a
+/// constant so the two modes share the same anti-repeat / user-override / build-on-prior
+/// guarantees — previously the conversational chat path missed these because they lived only
+/// in the commentator's observation prompt.
+private let insightsUniversalRules = """
+Universal rules — apply to every reply except minimal-mode (JSON / extraction) calls:
+
+1. Build on prior turns. Read the conversation history above. Reference what the user has \
+already said when relevant. Don't restart topics. Don't introduce something new when a thread \
+is unfinished. Don't repeat phrases, jokes, observations, or specific examples you've used \
+before.
+
+2. The user is ground truth. Scan EVERY user message above. If the user has clarified, \
+corrected, or contextualized any item ("that's my kid's class", "she's home sick", "ignore \
+that meeting", "I'm just helping a friend") — that clarification is BINDING and PERMANENT. \
+Calendar and activity data are signals; the user's own words override them. Never re-raise \
+an item the user has already addressed.
+
+3. Calendar takes priority for interpretation. When a calendar event is IN PROGRESS, the \
+user's surface app is in service of that meeting. Comment on the meeting, not the app.
+
+4. Idle interpretation: 0–2 min idle = actively engaged with the surface app. 3–8 min = \
+reading, thinking, brief break, or in a meeting listening. 9–15 min = may have stepped away. \
+You won't see >15 min idle here — the system suppresses commentary above that.
+
+5. "Earlier today" entries are historical. Refer to them in past tense; those apps may be \
+closed.
+"""
+
+private let commentaryRules = """
+Commentary mode rules:
+
+A. Keep it short. One or two sentences. No greeting, no preface, no self-introduction.
+
+B. SHAPE — vary structure across turns. Don't end with a rhetorical question if your last \
+3 turns ended with one. Don't use "X is a Y, the Y is a Z" metaphor scaffolds. Vary sentence \
+length and opening word.
+
+C. Self-coverage: if you have already commented on whatever is currently in focus (same app, \
+same window, same tab/URL) — do NOT comment on it again, even with different phrasing. \
+Exceptions: a calendar event has just begun or ended (genuinely new context), or the user \
+has been at this so long that the duration itself is the new observation. Otherwise return \
+"-" (single character) and stay silent.
+
+D. Comment on what is happening NOW, not the historical "Earlier today" block.
+"""
+
+private let conversationRules = """
+Conversation mode rules:
+
+A. Engage with what the user actually said. The activity context below is for grounding — \
+something to reference when relevant — not the topic of the reply. If the user asked a \
+question, answer it. If they made a statement, respond to it.
+
+B. Build on the conversation. Reference past topics, callbacks, and earlier exchanges when \
+they fit. Don't restart the dialog. Don't ignore a thread the user just opened.
+
+C. Stay in voice. Personality is set; let it color the reply but don't let the voice swallow \
+the substance. If the user asks something concrete, answer concretely.
+
+D. Don't keep "observing" unprompted. Activity / calendar context is available for reference, \
+not as a topic to volunteer about every turn.
+"""
+
+/// Builds the layered system prompt: identity → personality → mode-specific rules → optional
+/// observation context. Commentator passes `.commentary`; chat passes `.conversation`;
+/// JSON-extraction paths pass `.minimal`.
+func buildInsightsSystemPrompt(personality: InsightsPersonality, mode: InsightsPromptMode = .conversation, observationContext: String? = nil) -> String {
     var parts: [String] = [notchnikIdentityPrompt]
     if let p = personality.systemPrompt {
         parts.append(p)
+    }
+    switch mode {
+    case .commentary, .conversation:
+        // Live current-date/time header — models otherwise have no reliable sense of when
+        // "now" is, which matters for both "comment on what's happening today" and reasoning
+        // about the timestamps appended to chat history.
+        parts.append(currentDateTimeHeader())
+        parts.append(insightsUniversalRules)
+        parts.append(mode == .commentary ? commentaryRules : conversationRules)
+    case .minimal:
+        break
     }
     if let observationContext {
         parts.append(observationContext)
     }
     return parts.joined(separator: "\n\n")
+}
+
+extension OllamaClient.ChatMessage {
+    /// Returns a copy with an absolute "[YYYY-MM-DD h:mm a]" timestamp prepended to the
+    /// content. Lets the model reason about WHEN each turn happened, so the commentator's
+    /// "today only" filter and the conversation's references to past-day topics can both
+    /// rely on grounded times rather than the model guessing.
+    func withTimestampPrefix() -> OllamaClient.ChatMessage {
+        guard let ts = timestamp else { return self }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd h:mm a"
+        let stamped = "[\(formatter.string(from: ts))] " + content
+        return OllamaClient.ChatMessage(id: id, role: role, content: stamped, timestamp: ts)
+    }
 }
 
 /// Single source of truth for "what is the user doing right now + what's on their calendar +
@@ -156,12 +272,13 @@ enum InsightsContextBuilder {
         let timeFormatter = DateFormatter()
         timeFormatter.dateFormat = "h:mm a"
 
-        // Newest-first, cap at 40 sessions — far more than a typical day produces.
-        let recent = sessions.reversed().prefix(40)
+        // Newest-first, cap at 40 sessions. Any nonzero session displays as at least 1 min so
+        // the user / model see brief activity rather than confusingly-rounded "0m" entries.
+        let recent = sessions.reversed().filter { $0.totalSeconds > 0 }.prefix(40)
         return recent.map { session -> String in
-            let durMin = Int(session.totalSeconds / 60)
-            let activeMin = Int(session.activeSeconds / 60)
-            let durStr = durMin <= 0 ? "<1m" : "\(durMin)m"
+            let durMin = max(1, Int(session.totalSeconds / 60))
+            let activeMin = max(1, Int(session.activeSeconds / 60))
+            let durStr = "\(durMin)m"
             let activeStr = activeMin < durMin ? " (\(activeMin)m active)" : ""
             var line = "\(timeFormatter.string(from: session.startTime))–\(timeFormatter.string(from: session.endTime)) [\(durStr)\(activeStr)] \(session.appName)"
             if session.distinctSubjects > 1 {
@@ -350,11 +467,14 @@ final class InsightsChatStore: ObservableObject {
         lastError = nil
         defer { isLoading = false }
 
-        let system = buildInsightsSystemPrompt(personality: personality, observationContext: observationContext)
+        // Conversational reply path — the user just typed something. Apply conversation rules
+        // (engage, build on dialog) on top of the universal rules. Send the FULL transcript
+        // with timestamps prepended so the model can reason about when topics came up.
+        let system = buildInsightsSystemPrompt(personality: personality, mode: .conversation, observationContext: observationContext)
         var payload: [OllamaClient.ChatMessage] = [
             OllamaClient.ChatMessage(role: .system, content: system)
         ]
-        payload.append(contentsOf: messages)
+        payload.append(contentsOf: messages.map { $0.withTimestampPrefix() })
 
         do {
             let reply = try await OllamaClient.chat(
@@ -917,9 +1037,19 @@ struct FocusScoreDetailView: View {
 private struct NowSection: View {
     let score: FocusScore?
 
+    /// Same gate the pill uses — only treat the current entry as "the current hour" when its
+    /// windowStart sits at the current clock hour. The just-completed-hour entry has
+    /// windowStart 1 hour back, so it doesn't qualify.
+    private var isInProgressForCurrentHour: Bool {
+        guard let score else { return false }
+        let cal = Calendar.current
+        let nowHourStart = cal.date(bySettingHour: cal.component(.hour, from: Date()), minute: 0, second: 0, of: Date()) ?? Date()
+        return score.windowStart == nowHourStart
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            if let score {
+            if let score, isInProgressForCurrentHour {
                 HStack(alignment: .center, spacing: 18) {
                     ZStack {
                         Circle()
@@ -980,9 +1110,23 @@ private struct NowSection: View {
                 }
                 Spacer(minLength: 0)
             } else {
-                Text("Focus score will appear once enough activity has been logged.")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
+                // No in-progress entry for the current hour. Either the hour just rolled over
+                // and there's not enough activity yet (10-min threshold), or the user hasn't
+                // had any captured activity this hour. Day tab still has the just-completed
+                // hour and earlier history; this view stays clean rather than showing a stale
+                // last-hour score as if it were current.
+                VStack(alignment: .leading, spacing: 6) {
+                    Image(systemName: "gauge.with.dots.needle.0percent")
+                        .font(.system(size: 28, weight: .light))
+                        .foregroundStyle(.secondary)
+                    Text("No score for this hour yet")
+                        .font(.system(size: 13, weight: .semibold))
+                    Text("Scores appear once you've been active for at least 10 minutes in the current clock hour. Earlier hours are in the Day tab.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
     }

@@ -14,13 +14,23 @@ import Foundation
 
 @MainActor
 final class InsightsCommentator: ObservableObject {
-    /// How often the timer ticks. Each tick is independent: 60% chance to fire, 40% to skip.
-    private let tickInterval: TimeInterval = 5 * 60   // 5 minutes
-    /// Probability of producing a comment on each tick.
-    private let triggerProbability: Double = 0.60
-    /// Idle threshold for "user is gone, don't comment." Was 5 min, which silenced the bot any
-    /// time the user paused to read or think. 15 min is a more honest "they walked away" line.
+    /// Period for the long-dwell check. Doesn't fire commentary on its own — only triggers
+    /// `tick()` when the user has been on the same context for >= `longDwellThreshold`
+    /// without a recent comment, OR when a calendar event boundary just crossed. The 60%
+    /// random-gate from the old timer-driven design is gone; firing is now deterministic.
+    private let timerCheckInterval: TimeInterval = 5 * 60
+    /// How long the user must be on the same context before the long-dwell check considers a
+    /// "you've been at this a while" remark. Combined with the existing 2-hour same-context
+    /// suppression, this means at most one such remark per long stretch.
+    private let longDwellThreshold: TimeInterval = 30 * 60
+    /// Idle threshold for "user is gone, don't comment."
     private let afkIdleThreshold: TimeInterval = 15 * 60
+    /// Hard minimum between commentary fires, regardless of trigger source. Two triggers
+    /// (context change settle + calendar boundary, etc.) can land within seconds of each
+    /// other — same-context guard only catches matching app/window/tab, so a meeting that
+    /// also coincides with a context switch could double-fire. This cooldown ensures at
+    /// most one comment in any rolling 5-minute window. Forced "Comment now" bypasses.
+    private let minTimeBetweenComments: TimeInterval = 5 * 60
 
     /// Structural directives, one chosen at random per tick. Forces the model out of any single
     /// scaffold (rhetorical-question close, "X is a Y, Y is a Z" metaphor stacks, etc.) by
@@ -53,6 +63,7 @@ final class InsightsCommentator: ObservableObject {
         case skippedTransient = "Skipped — transient frontmost app"
         case skippedSameContext = "Skipped — same context as recent comment"
         case skippedSleeping = "Skipped — system asleep / lid closed"
+        case skippedCooldown = "Skipped — within cooldown after last comment"
         case modelEmpty = "Model returned empty"
         case modelSentinel = "Model said -"
         case modelError = "Model errored"
@@ -185,14 +196,47 @@ final class InsightsCommentator: ObservableObject {
 
     private func start() {
         guard timer == nil else { return }
-        let timer = Timer(timeInterval: tickInterval, repeats: true) { [weak self] _ in
+        // Periodic check (not auto-fire). Every `timerCheckInterval`, evaluate whether the
+        // user has been on the same context long enough to warrant a remark, OR whether a
+        // calendar boundary just crossed. Most ticks do nothing; the same-context guard
+        // ensures we don't double-fire when conditions haven't changed.
+        let timer = Timer(timeInterval: timerCheckInterval, repeats: true) { [weak self] _ in
             guard let self else { return }
-            Task { @MainActor in
-                await self.tick()
+            Task { @MainActor [weak self] in
+                await self?.periodicCheck()
             }
         }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
+    }
+
+    /// Periodic check (5-min cadence). Conditions to fire:
+    /// - User has been on same context for >= longDwellThreshold AND we haven't commented on
+    ///   that context recently (same-context guard handles the recency).
+    /// - A calendar event has started or ended in the last `timerCheckInterval`.
+    /// Otherwise no-op.
+    private func periodicCheck() async {
+        guard let activity, let calendar = self.calendar else { return }
+
+        // Long-dwell condition: latest event's streak duration is past threshold.
+        if let latest = activity.latestEvent {
+            let streakDuration = (latest.endTimestamp ?? latest.timestamp).timeIntervalSince(latest.timestamp)
+            if streakDuration >= longDwellThreshold {
+                await tick()
+                return
+            }
+        }
+
+        // Calendar boundary: did any event start or end within the last check window?
+        let now = Date()
+        let lookback = now.addingTimeInterval(-timerCheckInterval)
+        let crossedBoundary = calendar.events.contains { event in
+            (event.start > lookback && event.start <= now) ||
+            (event.end > lookback && event.end <= now)
+        }
+        if crossedBoundary {
+            await tick()
+        }
     }
 
     private func stop() {
@@ -232,20 +276,26 @@ final class InsightsCommentator: ObservableObject {
             lastTickResult = .skippedNoAX
             return
         }
-        // Forced ticks bypass the enable/AFK/probability gates; otherwise honor them.
+        // Forced ticks bypass the enable / AFK / cooldown gates; otherwise honor them. The
+        // random-gate dice is gone — firing is now deterministic, driven by context changes,
+        // calendar boundaries, or long-dwell. The same-context + cooldown guards below
+        // handle "don't repeat" / "don't double-fire" without needing probabilistic skipping.
         if !forceFire {
             guard settings.insightsCommentaryEnabled else {
                 lastTickResult = .skippedDisabled
                 return
             }
-            // AFK guard: if the user hasn't touched mouse/keyboard in 15+ minutes, treat them as
-            // walked-away. Lower thresholds silenced the bot during normal reading/thinking.
             if let idle = activity.latestEvent?.idleSecondsAtCapture, idle >= afkIdleThreshold {
                 lastTickResult = .skippedAFK
                 return
             }
-            guard Double.random(in: 0..<1) < triggerProbability else {
-                lastTickResult = .skippedDice
+            // Hard cooldown across all trigger sources. Multiple triggers (context-change
+            // settle + calendar boundary + long-dwell) can land within seconds of each
+            // other, especially when a meeting starts and the user simultaneously switches
+            // apps. The same-context guard only catches matching app/window/tab pairs;
+            // this covers the cross-context double-fire case.
+            if let last = lastCommentAt, Date().timeIntervalSince(last) < minTimeBetweenComments {
+                lastTickResult = .skippedCooldown
                 return
             }
         }
@@ -295,80 +345,19 @@ final class InsightsCommentator: ObservableObject {
         // is a Y, Y is a Z. What's the W doin' to the Z?") and mass-produce variants of it.
         let directive = structuralDirectives.randomElement() ?? structuralDirectives[0]
         let observation = """
-        You are observing the user's desktop activity and offering an unsolicited remark in your voice. \
-        Don't greet, preface, introduce yourself, or mention that you're commenting automatically. \
-        You should produce a remark on most ticks — silence is rarely the right call.
+        You are observing the user's desktop activity and offering an unsolicited remark in \
+        your voice. Don't greet, preface, or introduce yourself. The universal + commentary \
+        rules above govern when to speak vs. stay silent ("-").
 
         SHAPE FOR THIS TURN: \(directive)
 
-        Anti-pattern rules (these matter — read your previous assistant turns above and check):
-        - Do NOT end with a rhetorical question if you've ended with one in your last 3 turns.
-        - Do NOT use "X is a Y, the Y is a Z" metaphor scaffolds.
-        - Do NOT reuse signature phrases from earlier turns ("the heat doin' to the beans", \
-        "the screen's a hearth", named slides, named documents, etc.).
-        - Vary sentence length and opening word from your previous turns.
-
-        Self-coverage rule: scan your own previous assistant turns above. If you have already \
-        commented (even once) on whatever is currently in focus — same app, same window, same \
-        tab/URL — do NOT comment on it again, even with different phrasing. The user has \
-        already read those comments; repeating yourself creatively is worse than silence. \
-        Exceptions: a calendar event has just begun or ended (genuinely new context), or the \
-        user has been at this so long that the duration itself is the new observation. \
-        Otherwise, return "-" alone and stay silent.
-
-        ABSOLUTE USER OVERRIDE — read carefully. Before composing this turn:
-
-        1. Scan EVERY user message above (not just the most recent — ALL of them).
-        2. For each calendar event listed in "Calendar context" below, and for each app/site \
-        listed in the focus or earlier-today blocks, ask: has the user said anything about it?
-        3. If the user has clarified, corrected, or contextualized any item — even casually \
-        ("that's my kid's class", "she's home sick", "this isn't mine", "just helping a friend", \
-        "ignore that meeting") — that clarification is BINDING and PERMANENT for the rest of \
-        the conversation. The user is ground truth; the calendar and activity data are not.
-        4. NEVER mention an item the user has already spoken about. Don't re-raise it, don't \
-        reference it indirectly, don't ask about it. Move on to something the user has NOT \
-        commented on, or stay silent.
-
-        Concrete: if the user said "Anna's home sick, she didn't go to dance class" and the \
-        calendar shows "Dance class IN PROGRESS," DO NOT mention dance class. The user has \
-        already settled what's happening with that block.
-
-        Comment on what is happening NOW. Three signals to integrate, in priority order:
-
-        1. CALENDAR. When a calendar event is IN PROGRESS, the user is in that meeting / block, \
-        and whatever app is frontmost is being used in service of it. Comment on the meeting and \
-        how the activity fits its purpose, not on the literal app. ("Running point on the slides \
-        for the council session" beats "you're staring at slide 4 again.")
-
-        2. IDLE. The "Idle (no input): X min" line is real — the user hasn't touched the \
-        keyboard or trackpad in X minutes. Interpret it like this:
-           - 0–2 min idle: actively engaged with the surface app. Comment on the activity.
-           - 3–8 min idle: reading, thinking, on a brief break, or in a meeting listening. \
-           Don't assume active engagement. If a calendar event is in progress, comment on the \
-           meeting; if not, the comment can acknowledge the pause ("standing back from X").
-           - 9–15 min idle: user may have stepped away. Don't claim they're "doing" anything \
-           on screen. If a calendar event is in progress, treat as in-meeting and not at the \
-           keyboard. If not, the comment should reflect "stepped away" honestly, not project \
-           activity onto the frozen screen.
-           (You won't see >15 min idle here — the system suppresses commentary above that.)
-
-        3. SURFACE APP. Use what's frontmost only after considering the above. The app is the \
-        weakest of the three signals on its own.
-
-        Do not riff on items under "Earlier today" as if they were still on screen; those apps \
-        may be closed.
-
-        FINAL CHECK before responding: re-read the user's most recent few messages one more \
-        time. If anything you were about to say touches on a calendar event, app, or topic the \
-        user has already addressed — drop it. Pick something fresh, or return "-" alone.
-
-        Only return the single character "-" (and nothing else) if you would otherwise be exactly \
-        repeating a previous turn. Otherwise, say something.
-
         \(context)
         """
+        // Autonomous remark path — apply commentary rules (short, varied, may be silent) on
+        // top of the universal rules.
         let systemPrompt = buildInsightsSystemPrompt(
             personality: personality,
+            mode: .commentary,
             observationContext: observation
         )
 
@@ -377,11 +366,20 @@ final class InsightsCommentator: ObservableObject {
         // dropping those, leading to the commentator re-running canned riffs about already-
         // corrected calendar items. The anti-repetition pressure from echoing one's own
         // style is now handled in the prompt rules above (anti-pattern + self-coverage).
-        let recentTail = Array(chat.messages.suffix(40))
+        // Commentator only looks at TODAY'S history — autonomous remarks shouldn't reference
+        // older threads. Each message gets a timestamp prefix so the model can ground its
+        // reasoning ("you said X earlier this morning") in real times. Conversational chat
+        // path uses the full transcript instead.
+        let cal = Calendar.current
+        let startOfDay = cal.startOfDay(for: Date())
+        let todayMessages = chat.messages.filter { msg in
+            guard let ts = msg.timestamp else { return false }
+            return ts >= startOfDay
+        }
         var payload: [OllamaClient.ChatMessage] = [
             OllamaClient.ChatMessage(role: .system, content: systemPrompt)
         ]
-        payload.append(contentsOf: recentTail)
+        payload.append(contentsOf: todayMessages.map { $0.withTimestampPrefix() })
         payload.append(OllamaClient.ChatMessage(role: .user, content: "Say something."))
 
         do {
