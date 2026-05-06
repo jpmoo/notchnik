@@ -1441,7 +1441,7 @@ struct WindowSummary {
             rows.append(FocusScore.TopApp(
                 appName: app.appName,
                 bundleID: app.bundleID,
-                minutes: max(1, Int(app.seconds / 60)),
+                minutes: max(1, Int((app.seconds + 30) / 60)),
                 category: app.bundleID.flatMap { settings.appCategories[$0] }
             ))
         }
@@ -1453,7 +1453,7 @@ struct WindowSummary {
             rows.append(FocusScore.TopApp(
                 appName: host.host,
                 bundleID: host.host,                          // reused as category-lookup key on display side
-                minutes: max(1, Int(host.seconds / 60)),
+                minutes: max(1, Int((host.seconds + 30) / 60)),
                 category: resolvedCategory
             ))
         }

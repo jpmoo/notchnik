@@ -276,8 +276,8 @@ enum InsightsContextBuilder {
         // the user / model see brief activity rather than confusingly-rounded "0m" entries.
         let recent = sessions.reversed().filter { $0.totalSeconds > 0 }.prefix(40)
         return recent.map { session -> String in
-            let durMin = max(1, Int(session.totalSeconds / 60))
-            let activeMin = max(1, Int(session.activeSeconds / 60))
+            let durMin = max(1, Int((session.totalSeconds + 30) / 60))
+            let activeMin = max(1, Int((session.activeSeconds + 30) / 60))
             let durStr = "\(durMin)m"
             let activeStr = activeMin < durMin ? " (\(activeMin)m active)" : ""
             var line = "\(timeFormatter.string(from: session.startTime))–\(timeFormatter.string(from: session.endTime)) [\(durStr)\(activeStr)] \(session.appName)"
