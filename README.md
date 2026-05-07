@@ -1,6 +1,6 @@
 # NotchNik
 
-A macOS utility that lives in (and around) the hardware notch on MacBooks. Hover the notch and it swells; click it and a panel drops down with a clipboard history, a calendar agenda, a file-parking pen, and an AI chat that watches what you're doing and scores your focus.
+A macOS utility that lives in (and around) the hardware notch on MacBooks. Hover over the notch and it swells; click it and a panel drops down with a clipboard history, a calendar agenda, a file-parking pen, and an AI chat that watches what you're doing and scores your focus.
 
 > **This codebase is entirely vibe-coded.** Written interactively with an LLM doing most of the typing across many sessions, with the human steering, vetoing, and shaping intent. There's no architectural master plan; pieces accreted as ideas came up. Treat it as such — the code style is consistent within a session and drifts across sessions, comments explain *why* things landed where they did rather than what the code is doing, and a fair amount of design rationale lives in commit-style review rather than design docs.
 
@@ -16,7 +16,7 @@ A macOS utility that lives in (and around) the hardware notch on MacBooks. Hover
 
 Four sections live in the panel, each toggleable in Settings:
 
-- **Clipboard** — captures everything you copy (text, images, file references). Click to put back on the pasteboard, drag out to use, Quick Look previews for files. Configurable history depth.
+- **Clipboard** — captures everything you copy (text, images, file references). Click to put back on the pasteboard, Quick Look previews for files. Configurable history depth.
 - **Calendar** — subscribes to ICS feeds (Google Calendar links, iCloud shares, etc.). Two views: time-block grid or flat agenda. Color-coded per feed. RRULE expansion for recurring events.
 - **File Pen** — drag any file in to park it. Drag back out (with optional ⌘ for move vs. copy). Survives launches via security-scoped bookmarks. Useful for "I need this in fifteen minutes when I'm in a different app."
 - **Insights** — chat with a local [Ollama](https://ollama.com) model. The model gets context about what you're currently doing, what's on your calendar, and recent activity. Includes a focus-score system (per-hour 0–100, rolling history with day/week/month views, AI commentary in your chosen personality voice).
