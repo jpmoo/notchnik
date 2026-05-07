@@ -60,6 +60,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _ = clipboardStore
         _ = calendarStore
         _ = filePenStore
+
+        // Forward pasteboard file captures to the File Pen when the user opts in. The hook fires
+        // for every file URL the clipboard captures; we gate on the live setting here so flipping
+        // the toggle takes effect immediately without re-wiring.
+        clipboardStore.onFileURLCaptured = { [weak self] url in
+            guard let self else { return }
+            guard self.settingsStore.filePenAutoCaptureFromPasteboard else { return }
+            self.filePenStore.add(url)
+        }
         _ = insightsCommentator   // wires up its settings subscription so the timer flips on/off live
         _ = focusScoreEngine      // starts hourly focus scoring at launch
 

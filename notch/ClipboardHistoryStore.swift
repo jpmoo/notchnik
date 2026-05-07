@@ -187,6 +187,12 @@ final class ClipboardHistoryStore: ObservableObject {
     /// History item whose payload currently matches the general pasteboard (text, image, or file).
     @Published private(set) var pasteboardActiveItemID: UUID?
 
+    /// Optional hook fired whenever a file URL is captured from the pasteboard (single file or
+    /// any URL within a file group). AppDelegate wires this to FilePenStore.add when the user
+    /// has opted in via `filePenAutoCaptureFromPasteboard`. Receives URLs in the order they
+    /// appeared on the pasteboard.
+    var onFileURLCaptured: ((URL) -> Void)?
+
     private let settings: AppSettingsStore
     private var lastChangeCount: Int
     private var skipNextCapture = false
@@ -408,6 +414,9 @@ final class ClipboardHistoryStore: ObservableObject {
             } else {
                 refreshPasteboardActiveItem()
             }
+            // Forward to file-pen hook regardless of dedupe, so the pen stays in sync with whatever
+            // is currently on the pasteboard. FilePenStore.add already dedupes by path.
+            fileURLs.forEach { onFileURLCaptured?($0) }
             return
         }
 
@@ -424,6 +433,7 @@ final class ClipboardHistoryStore: ObservableObject {
             } else {
                 refreshPasteboardActiveItem()
             }
+            onFileURLCaptured?(fileURL)
             return
         }
 
@@ -554,10 +564,12 @@ final class ClipboardHistoryStore: ObservableObject {
         // the entire file (multi-GB stall, huge in-memory NSImage) just to decide it was a file all along.
         if fileURLs.count > 1 {
             insert(.fileGroup(fileURLs))
+            fileURLs.forEach { onFileURLCaptured?($0) }
             return
         }
         if let url = fileURLs.first {
             insert(.file(url))
+            onFileURLCaptured?(url)
             return
         }
 

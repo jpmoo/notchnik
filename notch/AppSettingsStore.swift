@@ -155,6 +155,7 @@ final class AppSettingsStore: ObservableObject {
         static let sectionOrder = "NotchNik.sectionOrder"
         static let filePenDefaultAction = "NotchNik.filePenDefaultAction"
         static let filePenCommandAction = "NotchNik.filePenCommandAction"
+        static let filePenAutoCaptureFromPasteboard = "NotchNik.filePenAutoCaptureFromPasteboard"
         static let ollamaURL = "NotchNik.ollamaURL"
         static let ollamaModel = "NotchNik.ollamaModel"
         static let insightsPersonality = "NotchNik.insightsPersonality"
@@ -341,6 +342,13 @@ final class AppSettingsStore: ObservableObject {
         didSet { UserDefaults.standard.set(filePenCommandAction.rawValue, forKey: Keys.filePenCommandAction) }
     }
 
+    /// When true, every file URL that lands on the system pasteboard (e.g., the user copies a
+    /// file in Finder) is also auto-added to the File Pen. Default off so users opt in — the
+    /// pen is meant to be intentional, not a mirror of every Finder copy.
+    @Published var filePenAutoCaptureFromPasteboard: Bool {
+        didSet { UserDefaults.standard.set(filePenAutoCaptureFromPasteboard, forKey: Keys.filePenAutoCaptureFromPasteboard) }
+    }
+
     /// Ollama endpoint configuration. URL points at the host:port; model is the chosen model name.
     @Published var ollamaURL: String {
         didSet { UserDefaults.standard.set(ollamaURL, forKey: Keys.ollamaURL) }
@@ -459,6 +467,7 @@ final class AppSettingsStore: ObservableObject {
         filePenDefaultAction = storedDefaultAction ?? .copy
         let storedCommandAction = defaults.string(forKey: Keys.filePenCommandAction).flatMap(FilePenDragAction.init(rawValue:))
         filePenCommandAction = storedCommandAction ?? .move
+        filePenAutoCaptureFromPasteboard = defaults.object(forKey: Keys.filePenAutoCaptureFromPasteboard) as? Bool ?? false
 
         ollamaURL = defaults.string(forKey: Keys.ollamaURL) ?? "http://localhost:11434"
         ollamaModel = defaults.string(forKey: Keys.ollamaModel) ?? ""

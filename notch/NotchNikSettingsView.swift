@@ -556,6 +556,16 @@ private struct FileInboxSettingsTab: View {
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
             }
+
+            Section {
+                Toggle("Auto-add files copied to the clipboard", isOn: $settings.filePenAutoCaptureFromPasteboard)
+            } header: {
+                Text("Pasteboard capture")
+            } footer: {
+                Text("When on, any file URL that lands on the system pasteboard (e.g., right-click → Copy in Finder) is also added to the File Pen. Duplicates are ignored.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
         .padding(.horizontal, 4)
