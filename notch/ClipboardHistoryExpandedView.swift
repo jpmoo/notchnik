@@ -638,6 +638,25 @@ private struct ClipboardThumbnailCell: View {
                             .animation(.easeInOut(duration: 0.18), value: isHighlighted)
                     }
                     .buttonStyle(.plain)
+                    // Drag the clip out to any drop target (URL field, text editor, Finder, etc.).
+                    // The pasteboard is untouched and the item stays in the panel — this is a copy
+                    // drag, not a move. For fileGroups, drags the first URL (SwiftUI's `.onDrag`
+                    // can only return one NSItemProvider).
+                    .onDrag {
+                        switch item.payload {
+                        case .text(let s):
+                            return NSItemProvider(object: s as NSString)
+                        case .image(let img):
+                            return NSItemProvider(object: img)
+                        case .file(let url):
+                            return NSItemProvider(object: url as NSURL)
+                        case .fileGroup(let urls):
+                            if let first = urls.first {
+                                return NSItemProvider(object: first as NSURL)
+                            }
+                            return NSItemProvider()
+                        }
+                    }
 
                     if showCopiedPill {
                         Text("Copied!")
