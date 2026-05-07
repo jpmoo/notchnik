@@ -120,6 +120,21 @@ final class FilePenStore: ObservableObject {
         save()
     }
 
+    /// Removes any pen entry whose URL points at the same file as `url` (path-equality on the
+    /// standardized file URL). Used to keep the pen in sync when the matching clipboard item is
+    /// deleted — the user's expectation is that deleting from clipboard also clears the pen.
+    func removeMatching(url: URL) {
+        guard url.isFileURL else { return }
+        let target = url.standardizedFileURL.path
+        let beforeCount = items.count
+        items.removeAll { item in
+            (item.url?.standardizedFileURL.path ?? "") == target
+        }
+        if items.count != beforeCount {
+            save()
+        }
+    }
+
     /// Removes every entry from the pen's manifest. Does NOT delete the underlying files — the pen
     /// only ever holds references, never copies, so there's nothing on disk to clean up here.
     func clearAll() {

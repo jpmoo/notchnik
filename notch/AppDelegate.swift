@@ -69,6 +69,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard self.settingsStore.filePenAutoCaptureFromPasteboard else { return }
             self.filePenStore.add(url)
         }
+
+        // Cascade clipboard deletions into the pen — regardless of whether auto-capture is on,
+        // since the user explicitly chose to remove the clip. (Adding back is gated; removing
+        // is not.)
+        clipboardStore.onFileURLRemoved = { [weak self] url in
+            self?.filePenStore.removeMatching(url: url)
+        }
         _ = insightsCommentator   // wires up its settings subscription so the timer flips on/off live
         _ = focusScoreEngine      // starts hourly focus scoring at launch
 

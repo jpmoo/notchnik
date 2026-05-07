@@ -193,6 +193,12 @@ final class ClipboardHistoryStore: ObservableObject {
     /// appeared on the pasteboard.
     var onFileURLCaptured: ((URL) -> Void)?
 
+    /// Fired when a file URL leaves clipboard history — either because the user deleted that
+    /// clip or cleared the entire history. AppDelegate wires this to FilePenStore.removeMatching
+    /// so the pen mirrors the deletion. Unlike `onFileURLCaptured` this is NOT gated on the
+    /// auto-capture toggle: an explicit clipboard deletion always cascades.
+    var onFileURLRemoved: ((URL) -> Void)?
+
     private let settings: AppSettingsStore
     private var lastChangeCount: Int
     private var skipNextCapture = false
@@ -884,6 +890,14 @@ final class ClipboardHistoryStore: ObservableObject {
             if case .image = item.payload {
                 deleteImageFile(id: item.id)
             }
+            switch item.payload {
+            case .file(let url):
+                onFileURLRemoved?(url)
+            case .fileGroup(let urls):
+                urls.forEach { onFileURLRemoved?($0) }
+            case .text, .image:
+                break
+            }
         }
         items.removeAll()
         cachedPasteboardImageHash = nil
@@ -893,8 +907,18 @@ final class ClipboardHistoryStore: ObservableObject {
 
     func deleteItem(id: UUID) {
         let wasActive = pasteboardActiveItemID == id
-        if let item = items.first(where: { $0.id == id }), case .image = item.payload {
-            deleteImageFile(id: id)
+        if let item = items.first(where: { $0.id == id }) {
+            if case .image = item.payload {
+                deleteImageFile(id: id)
+            }
+            switch item.payload {
+            case .file(let url):
+                onFileURLRemoved?(url)
+            case .fileGroup(let urls):
+                urls.forEach { onFileURLRemoved?($0) }
+            case .text, .image:
+                break
+            }
         }
         items.removeAll { $0.id == id }
         // If the deleted item is what the system pasteboard currently holds, wipe the pasteboard too —
