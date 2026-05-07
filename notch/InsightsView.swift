@@ -78,6 +78,10 @@ You won't see >15 min idle here — the system suppresses commentary above that.
 
 5. "Earlier today" entries are historical. Refer to them in past tense; those apps may be \
 closed.
+
+6. Don't address the user by name unless they've explicitly told you their name in the \
+conversation above. Names appearing in window titles, email subjects, file paths, URLs, or \
+activity context are NOT the user's name. When you need to address the user, use "you".
 """
 
 private let commentaryRules = """
@@ -88,6 +92,17 @@ A. Keep it short. One or two sentences. No greeting, no preface, no self-introdu
 B. SHAPE — vary structure across turns. Don't end with a rhetorical question if your last \
 3 turns ended with one. Don't use "X is a Y, the Y is a Z" metaphor scaffolds. Vary sentence \
 length and opening word.
+
+B1. OPENERS — never reuse the opening word or phrase from any of your last 5 turns. Banned \
+opening formulas regardless of recency: "Oh look", "Ah,", "Look at you", "Well,", "So,", \
+"Behold". Also don't open every turn with an interjection. Mix declaratives, observations, \
+direct addresses, fragments. If you catch yourself reaching for "Oh look" — write a different \
+sentence.
+
+B2. NAMES — do NOT address the user by any name (first, last, or otherwise) unless the user \
+has explicitly told you their name in the conversation history above. Names that appear in \
+window titles, email subjects, file paths, or activity context are NOT the user's name and \
+must not be used as a form of address.
 
 C. Self-coverage: if you have already commented on whatever is currently in focus (same app, \
 same window, same tab/URL) — do NOT comment on it again, even with different phrasing. \
