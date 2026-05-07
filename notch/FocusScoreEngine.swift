@@ -235,7 +235,7 @@ final class FocusScoreEngine: ObservableObject {
             windowEnd: windowEnd,
             commentary: commentary,
             topApps: summary.topApps(in: settings),
-            idleMinutes: Int(summary.idleSeconds / 60),
+            idleMinutes: Int((summary.idleSeconds + 30) / 60),
             scoringVersion: Self.currentScoringVersion,
             categoriesRevision: settings.appCategoriesRevision
         )
@@ -299,7 +299,7 @@ final class FocusScoreEngine: ObservableObject {
         }
         let top = summary.appTotals.first
         if let top {
-            let mins = Int(top.seconds / 60)
+            let mins = Int((top.seconds + 30) / 60)
             return "Mostly \(top.appName) (\(mins) min) with \(summary.switches) context switches."
         }
         return "\(summary.switches) switches across \(summary.distinctContexts) contexts."
@@ -318,14 +318,14 @@ final class FocusScoreEngine: ObservableObject {
             return "- \(row.appName) (\(row.minutes) min, \(cat))"
         }.joined(separator: "\n")
 
-        let activeMin = Int(summary.totalSeconds / 60)
-        let nonCountingMin = Int(summary.nonCountingActiveSeconds / 60)
-        let idleMin = Int(summary.idleSeconds / 60)
+        let activeMin = Int((summary.totalSeconds + 30) / 60)
+        let nonCountingMin = Int((summary.nonCountingActiveSeconds + 30) / 60)
+        let idleMin = Int((summary.idleSeconds + 30) / 60)
         let userPrompt = """
         Compute a focus score for the last hour of the user's desktop activity.
 
         Stats:
-        - Longest unbroken active streak on one app or website: \(Int(summary.longestStreakSeconds / 60)) min
+        - Longest unbroken active streak on one app or website: \(Int((summary.longestStreakSeconds + 30) / 60)) min
         - Total context switches: \(summary.switches)
         - Distinct contexts (app+window+tab): \(summary.distinctContexts)
         - Active time (idle subtracted, counting categories only): \(activeMin) min
@@ -727,7 +727,7 @@ final class FocusScoreEngine: ObservableObject {
                     windowEnd: window.end,
                     commentary: commentary,
                     topApps: summary.topApps(in: settings),
-                    idleMinutes: Int(summary.idleSeconds / 60),
+                    idleMinutes: Int((summary.idleSeconds + 30) / 60),
                     scoringVersion: Self.currentScoringVersion
                 )
                 self.history.record(score)
@@ -813,8 +813,8 @@ final class FocusScoreEngine: ObservableObject {
                 }
             }
         } else {
-            activeMin = Int(summary.totalSeconds / 60)
-            nonCountingMin = Int(summary.nonCountingActiveSeconds / 60)
+            activeMin = Int((summary.totalSeconds + 30) / 60)
+            nonCountingMin = Int((summary.nonCountingActiveSeconds + 30) / 60)
         }
         let idleMin = Int(summary.idleSeconds / 60)
         let wallMin = activeMin + nonCountingMin + idleMin
@@ -850,7 +850,7 @@ final class FocusScoreEngine: ObservableObject {
             nonCountingActiveMinutes: nonCountingMin,
             idleMinutes: idleMin,
             wallMinutes: wallMin,
-            longestStreakMinutes: Int(summary.longestStreakSeconds / 60),
+            longestStreakMinutes: Int((summary.longestStreakSeconds + 30) / 60),
             switches: summary.switches,
             distinctContexts: summary.distinctContexts,
             topApps: topApps,
@@ -1092,7 +1092,7 @@ final class FocusScoreEngine: ObservableObject {
                     windowEnd: window.end,
                     commentary: commentary,
                     topApps: summary.topApps(in: settings),
-                    idleMinutes: Int(summary.idleSeconds / 60),
+                    idleMinutes: Int((summary.idleSeconds + 30) / 60),
                     scoringVersion: Self.currentScoringVersion
                 )
                 self.history.record(score)
