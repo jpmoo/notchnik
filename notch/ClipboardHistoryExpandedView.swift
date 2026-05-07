@@ -34,6 +34,24 @@ private func makeImageItemProvider(_ image: NSImage) -> NSItemProvider {
     return provider
 }
 
+/// Builds a drag item provider for one or more files that "behaves like a paste" — Finder /
+/// file inputs receive the file URL(s); plain-text fields receive the file path(s) as text
+/// (newline-joined for multiple), matching what NSPasteboard would yield from a Finder copy.
+/// SwiftUI's `.onDrag` only allows ONE NSItemProvider, so for multi-file groups we drag the
+/// first URL as the file representation but expose all paths in the text fallback.
+private func makeFileItemProvider(urls: [URL]) -> NSItemProvider {
+    let primary = urls.first
+    let provider = primary.map { NSItemProvider(object: $0 as NSURL) } ?? NSItemProvider()
+    let pathsText = urls.map { $0.path }.joined(separator: "\n")
+    if let data = pathsText.data(using: .utf8), !data.isEmpty {
+        provider.registerDataRepresentation(forTypeIdentifier: UTType.utf8PlainText.identifier, visibility: .all) { completion in
+            completion(data, nil)
+            return nil
+        }
+    }
+    return provider
+}
+
 /// Bottom boundary only: left arc, straight segment, right arc — for accent stroke (matches `PanelSilhouetteShape` geometry).
 private struct ExpandedPanelBottomEdgeShape: Shape {
     var bottomCornerRadius: CGFloat = NotchMetrics.panelCornerRadiusLimit
@@ -677,12 +695,9 @@ private struct ClipboardThumbnailCell: View {
                         case .image(let img):
                             return makeImageItemProvider(img)
                         case .file(let url):
-                            return NSItemProvider(object: url as NSURL)
+                            return makeFileItemProvider(urls: [url])
                         case .fileGroup(let urls):
-                            if let first = urls.first {
-                                return NSItemProvider(object: first as NSURL)
-                            }
-                            return NSItemProvider()
+                            return makeFileItemProvider(urls: urls)
                         }
                     }
 
