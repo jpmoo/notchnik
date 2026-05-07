@@ -816,7 +816,7 @@ final class FocusScoreEngine: ObservableObject {
             activeMin = Int((summary.totalSeconds + 30) / 60)
             nonCountingMin = Int((summary.nonCountingActiveSeconds + 30) / 60)
         }
-        let idleMin = Int(summary.idleSeconds / 60)
+        let idleMin = Int((summary.idleSeconds + 30) / 60)
         let wallMin = activeMin + nonCountingMin + idleMin
         let thresholdMin = Int(minScoredActiveSeconds / 60)
         let willScore = summary.totalSeconds >= minScoredActiveSeconds
