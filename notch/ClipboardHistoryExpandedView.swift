@@ -5,6 +5,34 @@
 
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
+
+/// Builds a drag item provider that exposes an image in multiple formats so it can be dropped
+/// into anything that accepts a paste — rich text fields (Mail, Messages, Notes), image wells,
+/// Finder, etc. Registers PNG, TIFF, and the NSImage object itself; targets pick whichever
+/// representation they understand. Plain single-line text fields (URL bars, search) won't
+/// accept images regardless — same as a paste.
+private func makeImageItemProvider(_ image: NSImage) -> NSItemProvider {
+    let provider = NSItemProvider()
+    let tiff = image.tiffRepresentation
+    if let tiff,
+       let rep = NSBitmapImageRep(data: tiff),
+       let png = rep.representation(using: .png, properties: [:]) {
+        provider.registerDataRepresentation(forTypeIdentifier: UTType.png.identifier, visibility: .all) { completion in
+            completion(png, nil)
+            return nil
+        }
+    }
+    if let tiff {
+        provider.registerDataRepresentation(forTypeIdentifier: UTType.tiff.identifier, visibility: .all) { completion in
+            completion(tiff, nil)
+            return nil
+        }
+    }
+    // Some receivers ask for the NSImage object directly; keep this as a fallback.
+    provider.registerObject(image, visibility: .all)
+    return provider
+}
 
 /// Bottom boundary only: left arc, straight segment, right arc — for accent stroke (matches `PanelSilhouetteShape` geometry).
 private struct ExpandedPanelBottomEdgeShape: Shape {
@@ -647,7 +675,7 @@ private struct ClipboardThumbnailCell: View {
                         case .text(let s):
                             return NSItemProvider(object: s as NSString)
                         case .image(let img):
-                            return NSItemProvider(object: img)
+                            return makeImageItemProvider(img)
                         case .file(let url):
                             return NSItemProvider(object: url as NSURL)
                         case .fileGroup(let urls):
