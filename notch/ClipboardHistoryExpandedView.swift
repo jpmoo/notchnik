@@ -15,9 +15,41 @@ import UniformTypeIdentifiers
 private func makeImageItemProvider(_ image: NSImage) -> NSItemProvider {
     let provider = NSItemProvider()
     let tiff = image.tiffRepresentation
-    if let tiff,
-       let rep = NSBitmapImageRep(data: tiff),
-       let png = rep.representation(using: .png, properties: [:]) {
+    let png: Data? = {
+        guard let tiff, let rep = NSBitmapImageRep(data: tiff) else { return nil }
+        return rep.representation(using: .png, properties: [:])
+    }()
+
+    // File representation FIRST. Browsers (Gmail compose, Slack web, GitHub editors, etc.)
+    // listen for `dataTransfer.files` on drop, which on macOS resolves through file-URL /
+    // file-promise drag types — NOT through public.png data alone. Materialize a temp PNG
+    // lazily so the browser receives a real file the same way it would from Finder.
+    provider.registerFileRepresentation(
+        forTypeIdentifier: UTType.png.identifier,
+        fileOptions: [],
+        visibility: .all
+    ) { completion in
+        guard let png else {
+            completion(nil, false, nil)
+            return nil
+        }
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("NotchNik-Drag", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("\(UUID().uuidString).png")
+        do {
+            try png.write(to: url, options: .atomic)
+            // `false` for `coordinated`: we don't need NSFileCoordinator for our temp file.
+            completion(url, false, nil)
+        } catch {
+            completion(nil, false, error)
+        }
+        return nil
+    }
+
+    // Then raw image data — for receivers that want bytes, not a file (Mail compose, Notes,
+    // any rich text view that pastes inline image data).
+    if let png {
         provider.registerDataRepresentation(forTypeIdentifier: UTType.png.identifier, visibility: .all) { completion in
             completion(png, nil)
             return nil
@@ -29,7 +61,7 @@ private func makeImageItemProvider(_ image: NSImage) -> NSItemProvider {
             return nil
         }
     }
-    // Some receivers ask for the NSImage object directly; keep this as a fallback.
+    // NSImage object fallback for legacy AppKit receivers.
     provider.registerObject(image, visibility: .all)
     return provider
 }
