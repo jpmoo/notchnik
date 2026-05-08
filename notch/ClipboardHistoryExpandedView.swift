@@ -13,55 +13,56 @@ import UniformTypeIdentifiers
 /// representation they understand. Plain single-line text fields (URL bars, search) won't
 /// accept images regardless — same as a paste.
 private func makeImageItemProvider(_ image: NSImage) -> NSItemProvider {
-    let provider = NSItemProvider()
     let tiff = image.tiffRepresentation
     let png: Data? = {
         guard let tiff, let rep = NSBitmapImageRep(data: tiff) else { return nil }
         return rep.representation(using: .png, properties: [:])
     }()
 
-    // File representation FIRST. Browsers (Gmail compose, Slack web, GitHub editors, etc.)
-    // listen for `dataTransfer.files` on drop, which on macOS resolves through file-URL /
-    // file-promise drag types — NOT through public.png data alone. Materialize a temp PNG
-    // lazily so the browser receives a real file the same way it would from Finder.
-    provider.registerFileRepresentation(
-        forTypeIdentifier: UTType.png.identifier,
-        fileOptions: [],
-        visibility: .all
-    ) { completion in
-        guard let png else {
-            completion(nil, false, nil)
-            return nil
-        }
+    // Browsers (Gmail compose, Slack web, GitHub editors, etc.) on drop look at the dragged
+    // item via the HTML5 DataTransfer.files API — which on macOS only populates if the drag
+    // exposes a real on-disk file URL with public.file-url. Lazy file representations don't
+    // always satisfy WebKit/Chromium drop handlers, so we materialize the PNG to disk
+    // SYNCHRONOUSLY at drag start and hand back an item provider built from that URL. That
+    // mirrors exactly what dragging a PNG out of Finder would deliver.
+    if let png {
         let dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("NotchNik-Drag", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let url = dir.appendingPathComponent("\(UUID().uuidString).png")
+        // Stable-ish filename. UUID prefix dodges collisions; ".png" extension lets the
+        // browser pick the right MIME / icon. The temp dir is cleaned by the OS.
+        let url = dir.appendingPathComponent("clipping-\(UUID().uuidString.prefix(8)).png")
         do {
             try png.write(to: url, options: .atomic)
-            // `false` for `coordinated`: we don't need NSFileCoordinator for our temp file.
-            completion(url, false, nil)
+            if let provider = NSItemProvider(contentsOf: url) {
+                provider.suggestedName = url.lastPathComponent
+                // Also register the raw PNG/TIFF bytes so receivers that prefer image data
+                // over file URLs (Mail compose, Notes, any rich text view) still get them.
+                provider.registerDataRepresentation(forTypeIdentifier: UTType.png.identifier, visibility: .all) { completion in
+                    completion(png, nil)
+                    return nil
+                }
+                if let tiff {
+                    provider.registerDataRepresentation(forTypeIdentifier: UTType.tiff.identifier, visibility: .all) { completion in
+                        completion(tiff, nil)
+                        return nil
+                    }
+                }
+                return provider
+            }
         } catch {
-            completion(nil, false, error)
+            // Fall through to the data-only provider below.
         }
-        return nil
     }
 
-    // Then raw image data — for receivers that want bytes, not a file (Mail compose, Notes,
-    // any rich text view that pastes inline image data).
-    if let png {
-        provider.registerDataRepresentation(forTypeIdentifier: UTType.png.identifier, visibility: .all) { completion in
-            completion(png, nil)
-            return nil
-        }
-    }
+    // Fallback: no PNG bytes (or temp write failed). Best-effort image representations only.
+    let provider = NSItemProvider()
     if let tiff {
         provider.registerDataRepresentation(forTypeIdentifier: UTType.tiff.identifier, visibility: .all) { completion in
             completion(tiff, nil)
             return nil
         }
     }
-    // NSImage object fallback for legacy AppKit receivers.
     provider.registerObject(image, visibility: .all)
     return provider
 }
