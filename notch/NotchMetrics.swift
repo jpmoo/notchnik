@@ -19,6 +19,12 @@ enum NotchMetrics {
     /// Extra width on hover, each side (`total +2×` this). See `NotchOverlayView`.
     static let hoverHorizontalExpansion: CGFloat = 6
 
+    /// Extra vertical band below the notch that becomes a file-drop target ONLY while a system-wide
+    /// file drag is in progress. Lets the user drop a file before the cursor reaches the screen's
+    /// top edge — avoiding macOS's edge-triggered Mission Control gesture. During normal use the
+    /// panel stays at its compact size so clicks below the notch pass through to apps beneath.
+    static let dropCatchmentExtraHeight: CGFloat = 80
+
     /// Duration for panel resize when toggling click-expanded (matches SwiftUI where used).
     static let panelExpandAnimationDuration: Double = 0.28
 

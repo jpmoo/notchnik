@@ -16,6 +16,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) lazy var clipboardStore = ClipboardHistoryStore(settings: settingsStore)
     @MainActor private(set) lazy var calendarStore = CalendarFeedStore()
     @MainActor private(set) lazy var filePenStore = FilePenStore()
+    @MainActor private(set) lazy var fileDragMonitor = FileDragMonitor()
     @MainActor private(set) lazy var insightsChatStore = InsightsChatStore()
     @MainActor private(set) lazy var activityWatcher = ActivityWatcher()
     @MainActor private(set) lazy var insightsCommentator = InsightsCommentator(
@@ -92,6 +93,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 .environmentObject(settingsStore)
                 .environmentObject(calendarStore)
                 .environmentObject(filePenStore)
+                .environmentObject(fileDragMonitor)
                 .environmentObject(insightsChatStore)
                 .environmentObject(activityWatcher)
                 .environmentObject(focusScoreEngine)
@@ -144,6 +146,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self.layoutModel.currentSection = target
                     }
                 }
+            }
+            .store(in: &cancellables)
+
+        // Grow / shrink the collapsed panel in lockstep with the system-wide file-drag state. We
+        // skip the resize when click-expanded is true — the big panel already swallows the
+        // catchment area, and resizing under the user mid-expand would jitter.
+        fileDragMonitor.$isFileDragActive
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] active in
+                guard let self, let panel = self.panel else { return }
+                guard !self.layoutModel.isClickExpanded else { return }
+                let screen = panel.screen ?? self.builtInOrMainScreen() ?? NSScreen.main!
+                panel.setFrame(
+                    self.panelFrame(clickExpanded: false, screen: screen, dragCatchmentActive: active),
+                    display: true,
+                    animate: false
+                )
             }
             .store(in: &cancellables)
 
@@ -387,7 +407,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// `originY = maxY - h + nudge + bleed` made `originY + height = maxY + nudge + bleed`, i.e. the window extended
     /// **above** the screen top. The compositor then clipped the top — horizontal cut through both rounded lips → it
     /// looked like **square 90° corners** even though the path was curved.
-    private func panelFrame(clickExpanded: Bool, screen: NSScreen) -> NSRect {
+    private func panelFrame(clickExpanded: Bool, screen: NSScreen, dragCatchmentActive: Bool = false) -> NSRect {
         let topBleed = NotchMetrics.expandedPanelTopCornerBleed
         let sideBleed = NotchMetrics.expandedPanelSideCornerBleed
         let contentW: CGFloat
@@ -398,7 +418,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             // Wide enough for hover width (`NotchOverlayView`) so growth stays symmetric and isn’t clipped.
             contentW = layoutModel.baseWidth + 2 * NotchMetrics.hoverHorizontalExpansion + 2 * sideBleed
-            contentH = layoutModel.baseHeight + NotchMetrics.hoverExpansion + topBleed
+            // While a system-wide file drag is in progress, grow the panel downward so the user can
+            // drop short of the screen's top edge (avoiding macOS's edge-triggered Mission Control).
+            // Reverts as soon as the drag ends, so passthrough below the notch is preserved in
+            // normal use.
+            let catchment = dragCatchmentActive ? NotchMetrics.dropCatchmentExtraHeight : 0
+            contentH = layoutModel.baseHeight + NotchMetrics.hoverExpansion + topBleed + catchment
         }
 
         let pad = NotchMetrics.shadowPadding
