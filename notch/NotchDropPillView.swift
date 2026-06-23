@@ -17,39 +17,44 @@ struct NotchDropPillView: View {
     @State private var dropTargeted = false
 
     var body: some View {
+        // The capsule view is ALWAYS present (so its `.onDrop` doesn't get torn down at the
+        // moment AppKit delivers the drop — that race was hanging the app). Visibility is
+        // controlled by opacity and hit-testing instead. Outside an active drag, opacity is 0
+        // and hit-testing is disabled, so the pill is invisible and inert.
+        let active = fileDragMonitor.isFileDragActive
         ZStack {
-            if fileDragMonitor.isFileDragActive {
-                Capsule(style: .continuous)
-                    .fill(Color.black.opacity(dropTargeted ? 0.92 : 0.78))
-                    .overlay(
-                        Capsule(style: .continuous)
-                            .strokeBorder(
-                                dropTargeted ? Color.accentColor : Color.white.opacity(0.35),
-                                lineWidth: dropTargeted ? 3 : 1.5
-                            )
-                    )
-                    .overlay(
-                        HStack(spacing: 8) {
-                            Image(systemName: "tray.and.arrow.down.fill")
-                                .font(.system(size: 16, weight: .semibold))
-                            Text("Drop into pen")
-                                .font(.system(size: 13, weight: .semibold))
-                        }
-                        .foregroundStyle(.white)
-                    )
-                    .shadow(color: .black.opacity(0.35), radius: 8, y: 2)
-                    .frame(width: NotchMetrics.dropPillWidth, height: NotchMetrics.dropPillHeight)
-                    .contentShape(Capsule(style: .continuous))
-                    .onDrop(of: [UTType.fileURL], isTargeted: $dropTargeted) { providers in
-                        let any = handleFileDrop(providers: providers)
-                        if any { NSSound(named: "Pop")?.play() }
-                        return any
+            Capsule(style: .continuous)
+                .fill(Color.black.opacity(dropTargeted ? 0.92 : 0.78))
+                .overlay(
+                    Capsule(style: .continuous)
+                        .strokeBorder(
+                            dropTargeted ? Color.accentColor : Color.white.opacity(0.35),
+                            lineWidth: dropTargeted ? 3 : 1.5
+                        )
+                )
+                .overlay(
+                    HStack(spacing: 8) {
+                        Image(systemName: "tray.and.arrow.down.fill")
+                            .font(.system(size: 16, weight: .semibold))
+                        Text("Drop into pen")
+                            .font(.system(size: 13, weight: .semibold))
                     }
-                    .transition(.scale(scale: 0.85).combined(with: .opacity))
-            }
+                    .foregroundStyle(.white)
+                )
+                .shadow(color: .black.opacity(0.35), radius: 8, y: 2)
+                .frame(width: NotchMetrics.dropPillWidth, height: NotchMetrics.dropPillHeight)
+                .contentShape(Capsule(style: .continuous))
+                .opacity(active ? 1 : 0)
+                .scaleEffect(active ? 1 : 0.85)
+                .allowsHitTesting(active)
+                .onDrop(of: [UTType.fileURL], isTargeted: $dropTargeted) { providers in
+                    let any = handleFileDrop(providers: providers)
+                    if any { NSSound(named: "Pop")?.play() }
+                    return any
+                }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .animation(.easeOut(duration: 0.18), value: fileDragMonitor.isFileDragActive)
+        .animation(.easeOut(duration: 0.18), value: active)
         .animation(.easeOut(duration: 0.14), value: dropTargeted)
     }
 

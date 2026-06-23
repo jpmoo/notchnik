@@ -46,8 +46,15 @@ final class FileDragMonitor: ObservableObject {
         guard leftDown else {
             if isFileDragActive { isFileDragActive = false }
             lastDragHadFiles = false
+            lastDragChangeCount = -1
             return
         }
+
+        // Once we've already detected an active file drag, do NOT keep probing the drag
+        // pasteboard. AppKit briefly locks the drag pasteboard during the drop transition, and
+        // a competing main-thread read at that moment was hanging the app. Active stays active
+        // until the next mouse-up clears it.
+        if isFileDragActive { return }
 
         let pb = NSPasteboard(name: .drag)
         if pb.changeCount != lastDragChangeCount {
@@ -57,8 +64,8 @@ final class FileDragMonitor: ObservableObject {
             lastDragHadFiles = pb.types?.contains(.fileURL) ?? false
         }
 
-        if lastDragHadFiles != isFileDragActive {
-            isFileDragActive = lastDragHadFiles
+        if lastDragHadFiles {
+            isFileDragActive = true
         }
     }
 }
