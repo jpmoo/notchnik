@@ -6,72 +6,59 @@
 import AppKit
 import Combine
 
-/// Detects system-wide left-mouse drags that carry file URLs on the drag pasteboard and publishes
-/// `isFileDragActive` while one is happening. `NotchOverlayView` listens to this to temporarily
-/// grow its drop catchment downward; `AppDelegate` listens to resize the host panel to match.
+/// Detects whether the user is currently dragging a file (from any app on the system) and
+/// publishes `isFileDragActive`. `NotchOverlayView` listens to this to temporarily grow its drop
+/// catchment downward; `AppDelegate` listens to resize the host panel to match.
 ///
-/// Uses `NSEvent` global + local monitors so we see drags from any app (Finder, Mail, etc.), not
-/// just our own. Global monitors don't fire inside fullscreen apps that have grabbed input — that's
-/// a rare case for file drags and not worth a more invasive hook.
+/// Polls `NSEvent.pressedMouseButtons` + `NSPasteboard(name: .drag)` at 30Hz instead of using
+/// `NSEvent` monitors — those monitors get suppressed while an OS-level drag session is in
+/// progress (events are routed directly to the drag manager), so they miss the very state we
+/// want to detect. The poll is microscopic (one Int read + one pasteboard `types` check) and
+/// only flips `isFileDragActive` when the verdict changes, so SwiftUI bodies don't churn.
 @MainActor
 final class FileDragMonitor: ObservableObject {
     @Published private(set) var isFileDragActive: Bool = false
 
-    private var globalDragMonitor: Any?
-    private var localDragMonitor: Any?
-    private var globalUpMonitor: Any?
-    private var localUpMonitor: Any?
-
-    /// Most-recent drag pasteboard `changeCount` we evaluated. When it changes, we re-read; while
-    /// it's unchanged we skip the pasteboard probe to keep the per-event handler near-free.
+    private var timer: Timer?
+    /// Memoize the last drag pasteboard `changeCount` we evaluated. While a drag is in progress
+    /// the count is stable, so we only do the (slightly heavier) `types` check when it shifts.
     private var lastDragChangeCount: Int = -1
+    private var lastDragHadFiles: Bool = false
 
     init() {
-        globalDragMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDragged) { [weak self] _ in
-            MainActor.assumeIsolated { self?.evaluateDragPasteboard() }
+        // 30Hz is plenty for UI feedback — the user perceives drag-start → catchment-grow as
+        // instantaneous at this rate. `tolerance` lets the OS coalesce the firings to save CPU.
+        let t = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.tick() }
         }
-        localDragMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDragged) { [weak self] event in
-            MainActor.assumeIsolated { self?.evaluateDragPasteboard() }
-            return event
-        }
-        globalUpMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseUp) { [weak self] _ in
-            MainActor.assumeIsolated { self?.clearDragState() }
-        }
-        localUpMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseUp) { [weak self] event in
-            MainActor.assumeIsolated { self?.clearDragState() }
-            return event
-        }
+        t.tolerance = 0.01
+        timer = t
     }
 
     deinit {
-        for monitor in [globalDragMonitor, localDragMonitor, globalUpMonitor, localUpMonitor] {
-            if let monitor { NSEvent.removeMonitor(monitor) }
-        }
+        timer?.invalidate()
     }
 
-    private func evaluateDragPasteboard() {
-        let pb = NSPasteboard(name: .drag)
-        guard pb.changeCount != lastDragChangeCount else {
-            // Already known — pasteboard hasn't been rewritten since the last check, so the
-            // file-drag verdict is unchanged. No work needed.
+    private func tick() {
+        // Bit 0 of `pressedMouseButtons` is the left button. If it's not held, there's no drag —
+        // bail before touching the pasteboard at all.
+        let leftDown = (NSEvent.pressedMouseButtons & 1) != 0
+        guard leftDown else {
+            if isFileDragActive { isFileDragActive = false }
+            lastDragHadFiles = false
             return
         }
-        lastDragChangeCount = pb.changeCount
-        let hasFiles: Bool = {
-            let opts: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
-            if let urls = pb.readObjects(forClasses: [NSURL.self], options: opts) as? [URL],
-               !urls.isEmpty {
-                return true
-            }
-            return false
-        }()
-        if hasFiles != isFileDragActive {
-            isFileDragActive = hasFiles
-        }
-    }
 
-    private func clearDragState() {
-        if isFileDragActive { isFileDragActive = false }
-        lastDragChangeCount = -1
+        let pb = NSPasteboard(name: .drag)
+        if pb.changeCount != lastDragChangeCount {
+            lastDragChangeCount = pb.changeCount
+            // `types` is a cheap header read — no payload load. We only need to know whether a
+            // file-URL representation was registered, not to read the URLs themselves.
+            lastDragHadFiles = pb.types?.contains(.fileURL) ?? false
+        }
+
+        if lastDragHadFiles != isFileDragActive {
+            isFileDragActive = lastDragHadFiles
+        }
     }
 }
