@@ -34,6 +34,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let sessionActions = NotchSessionActions()
 
     private var panel: NotchOverlayPanel?
+    /// Separate floating panel hosting `NotchDropPillView` — a small drop target that appears
+    /// well below the notch only while a file drag is in progress.
+    private var dropPillPanel: NotchOverlayPanel?
     private var layoutModel: NotchLayoutModel!
     private var screenObserver: NSObjectProtocol?
     private var outsideClickMonitors: [Any] = []
@@ -93,7 +96,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 .environmentObject(settingsStore)
                 .environmentObject(calendarStore)
                 .environmentObject(filePenStore)
-                .environmentObject(fileDragMonitor)
                 .environmentObject(insightsChatStore)
                 .environmentObject(activityWatcher)
                 .environmentObject(focusScoreEngine)
@@ -149,24 +151,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &cancellables)
 
-        // Grow / shrink the collapsed panel in lockstep with the system-wide file-drag state. We
-        // skip the resize when click-expanded is true — the big panel already swallows the
-        // catchment area, and resizing under the user mid-expand would jitter.
-        fileDragMonitor.$isFileDragActive
-            .dropFirst()
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] active in
-                guard let self, let panel = self.panel else { return }
-                guard !self.layoutModel.isClickExpanded else { return }
-                let screen = panel.screen ?? self.builtInOrMainScreen() ?? NSScreen.main!
-                panel.setFrame(
-                    self.panelFrame(clickExpanded: false, screen: screen, dragCatchmentActive: active),
-                    display: true,
-                    animate: false
-                )
-            }
-            .store(in: &cancellables)
-
         layoutModel.$isClickExpanded
             .dropFirst()
             .receive(on: DispatchQueue.main)
@@ -211,6 +195,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         positionExpandedPanel(panel)
         panel.orderFrontRegardless()
 
+        // Drop-pill panel: a separate borderless window below the notch that shows itself when
+        // FileDragMonitor detects a file drag anywhere on the system. Hosting it in its own
+        // window keeps the geometry and hit-testing independent of the main notch panel.
+        let pillHosting = NSHostingView(
+            rootView: NotchDropPillView()
+                .environmentObject(filePenStore)
+                .environmentObject(fileDragMonitor)
+        )
+        let pillPanel = NotchOverlayPanelFactory.makeHostingRoot(pillHosting)
+        self.dropPillPanel = pillPanel
+        positionDropPillPanel(pillPanel)
+        pillPanel.orderFrontRegardless()
+
+        // Visibility is driven by the monitor: the panel itself is always present and positioned,
+        // but the SwiftUI body inside renders nothing when no drag is active, so the window is
+        // visually empty and hit-test-inert outside the capsule shape.
+        fileDragMonitor.$isFileDragActive
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self, let pillPanel = self.dropPillPanel else { return }
+                self.positionDropPillPanel(pillPanel)
+            }
+            .store(in: &cancellables)
+
         screenObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
             object: nil,
@@ -220,6 +228,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.layoutModel.update(from: screen)
             if let panel = self.panel {
                 self.positionExpandedPanel(panel)
+            }
+            if let pillPanel = self.dropPillPanel {
+                self.positionDropPillPanel(pillPanel)
             }
         }
 
@@ -407,7 +418,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// `originY = maxY - h + nudge + bleed` made `originY + height = maxY + nudge + bleed`, i.e. the window extended
     /// **above** the screen top. The compositor then clipped the top — horizontal cut through both rounded lips → it
     /// looked like **square 90° corners** even though the path was curved.
-    private func panelFrame(clickExpanded: Bool, screen: NSScreen, dragCatchmentActive: Bool = false) -> NSRect {
+    private func panelFrame(clickExpanded: Bool, screen: NSScreen) -> NSRect {
         let topBleed = NotchMetrics.expandedPanelTopCornerBleed
         let sideBleed = NotchMetrics.expandedPanelSideCornerBleed
         let contentW: CGFloat
@@ -418,12 +429,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             // Wide enough for hover width (`NotchOverlayView`) so growth stays symmetric and isn’t clipped.
             contentW = layoutModel.baseWidth + 2 * NotchMetrics.hoverHorizontalExpansion + 2 * sideBleed
-            // While a system-wide file drag is in progress, grow the panel downward so the user can
-            // drop short of the screen's top edge (avoiding macOS's edge-triggered Mission Control).
-            // Reverts as soon as the drag ends, so passthrough below the notch is preserved in
-            // normal use.
-            let catchment = dragCatchmentActive ? NotchMetrics.dropCatchmentExtraHeight : 0
-            contentH = layoutModel.baseHeight + NotchMetrics.hoverExpansion + topBleed + catchment
+            contentH = layoutModel.baseHeight + NotchMetrics.hoverExpansion + topBleed
         }
 
         let pad = NotchMetrics.shadowPadding
@@ -445,6 +451,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Instant positioning (launch, screen change, or non-interactive updates).
+    /// Centers the drop-pill panel horizontally with the notch and anchors its top at
+    /// `dropPillTopOffset` below the screen's top edge. Frame is slightly oversized so the
+    /// transition's scale-up doesn't clip.
+    private func positionDropPillPanel(_ panel: NSWindow) {
+        guard let screen = panel.screen ?? builtInOrMainScreen() ?? NSScreen.main else { return }
+        let pad: CGFloat = 12
+        let w = NotchMetrics.dropPillWidth + 2 * pad
+        let h = NotchMetrics.dropPillHeight + 2 * pad
+        let centerX = NotchGeometry.notchCenterX(for: screen)
+        let screenTopY = screen.frame.maxY
+        let topY = screenTopY - NotchMetrics.dropPillTopOffset
+        let originY = topY - h
+        panel.setFrame(NSRect(x: centerX - w / 2, y: originY, width: w, height: h), display: true)
+    }
+
     private func positionExpandedPanel(_ panel: NSWindow) {
         guard let screen = builtInOrMainScreen() ?? NSScreen.main else { return }
         panel.setFrame(panelFrame(clickExpanded: layoutModel.isClickExpanded, screen: screen), display: true)

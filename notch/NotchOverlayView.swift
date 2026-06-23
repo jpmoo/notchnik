@@ -22,7 +22,6 @@ struct NotchOverlayView: View {
     @EnvironmentObject private var clipboard: ClipboardHistoryStore
     @EnvironmentObject private var settings: AppSettingsStore
     @EnvironmentObject private var filePen: FilePenStore
-    @EnvironmentObject private var fileDragMonitor: FileDragMonitor
     @State private var hovered = false
     @State private var dropTargeted = false
 
@@ -40,25 +39,13 @@ struct NotchOverlayView: View {
     }
     private var hoverExpandedHeight: CGFloat { layout.baseHeight + NotchMetrics.hoverExpansion }
 
-    /// True while we want the swollen silhouette: either the user is hovering OR a system-wide
-    /// file drag is in progress (so the notch visibly grows downward as a drop target before the
-    /// cursor reaches it).
-    private var isSwollen: Bool {
-        hovered || fileDragMonitor.isFileDragActive
-    }
-
     private var shapeWidth: CGFloat {
         if layout.isClickExpanded { return NotchMetrics.clickExpandedWidth }
-        return isSwollen ? hoverExpandedWidth : layout.baseWidth
+        return hovered ? hoverExpandedWidth : layout.baseWidth
     }
 
     private var shapeHeight: CGFloat {
         if layout.isClickExpanded { return NotchMetrics.clickExpandedHeight }
-        if fileDragMonitor.isFileDragActive {
-            // Drop catchment swell — tall enough that the user can release the file well below
-            // the screen's top edge.
-            return layout.baseHeight + NotchMetrics.hoverExpansion + NotchMetrics.dropCatchmentExtraHeight
-        }
         return hovered ? hoverExpandedHeight : layout.baseHeight
     }
 
@@ -93,7 +80,7 @@ struct NotchOverlayView: View {
                             } label: {
                                 ZStack {
                                     Group {
-                                        if isSwollen {
+                                        if hovered {
                                             PanelSilhouetteCanvasFill(
                                                 width: shapeWidth,
                                                 height: shapeHeight + NotchMetrics.expandedPanelTopCornerBleed
@@ -110,7 +97,7 @@ struct NotchOverlayView: View {
                                 }
                                 .frame(
                                     width: shapeWidth,
-                                    height: shapeHeight + (isSwollen ? NotchMetrics.expandedPanelTopCornerBleed : 0),
+                                    height: shapeHeight + (hovered ? NotchMetrics.expandedPanelTopCornerBleed : 0),
                                     alignment: .top
                                 )
                                 .shadow(
@@ -121,34 +108,9 @@ struct NotchOverlayView: View {
                                 )
                             }
                             .buttonStyle(NotchPressButtonStyle())
-                            // Hover stays bound to the silhouette itself, so a passing cursor below
-                            // the notch doesn't accidentally swell the panel during normal use.
                             .onHover { hovering in
                                 withAnimation(.easeOut(duration: 0.14)) {
                                     hovered = hovering
-                                }
-                            }
-                            // Drop region is the silhouette itself PLUS, while a system-wide file
-                            // drag is in progress, a tall transparent band extending downward (see
-                            // `FileDragMonitor` + `AppDelegate` panel resize). Lets the user drop a
-                            // file well before the cursor reaches the screen's top edge where
-                            // macOS's edge-triggered Mission Control gesture fires. The catchment
-                            // appears only during file drags so click passthrough below the notch
-                            // is preserved in normal use.
-                            .background(alignment: .top) {
-                                if fileDragMonitor.isFileDragActive {
-                                    Color.clear
-                                        .frame(
-                                            width: shapeWidth,
-                                            height: shapeHeight + NotchMetrics.dropCatchmentExtraHeight,
-                                            alignment: .top
-                                        )
-                                        .contentShape(Rectangle())
-                                        .onDrop(of: [UTType.fileURL], isTargeted: $dropTargeted) { providers in
-                                            let any = handleFileDrop(providers: providers)
-                                            if any { playDropConfirmationSound() }
-                                            return any
-                                        }
                                 }
                             }
                             .onDrop(of: [UTType.fileURL], isTargeted: $dropTargeted) { providers in
@@ -317,7 +279,6 @@ private func polarAngle(from center: CGPoint, to point: CGPoint) -> CGFloat {
         .environmentObject(NotchSessionActions())
         .environmentObject(AppSettingsStore())
         .environmentObject(FilePenStore())
-        .environmentObject(FileDragMonitor())
         .environmentObject(FocusScoreEngine(
             chat: InsightsChatStore(),
             activity: ActivityWatcher(),
