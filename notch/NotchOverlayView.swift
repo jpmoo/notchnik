@@ -40,13 +40,25 @@ struct NotchOverlayView: View {
     }
     private var hoverExpandedHeight: CGFloat { layout.baseHeight + NotchMetrics.hoverExpansion }
 
+    /// True while we want the swollen silhouette: either the user is hovering OR a system-wide
+    /// file drag is in progress (so the notch visibly grows downward as a drop target before the
+    /// cursor reaches it).
+    private var isSwollen: Bool {
+        hovered || fileDragMonitor.isFileDragActive
+    }
+
     private var shapeWidth: CGFloat {
         if layout.isClickExpanded { return NotchMetrics.clickExpandedWidth }
-        return hovered ? hoverExpandedWidth : layout.baseWidth
+        return isSwollen ? hoverExpandedWidth : layout.baseWidth
     }
 
     private var shapeHeight: CGFloat {
         if layout.isClickExpanded { return NotchMetrics.clickExpandedHeight }
+        if fileDragMonitor.isFileDragActive {
+            // Drop catchment swell — tall enough that the user can release the file well below
+            // the screen's top edge.
+            return layout.baseHeight + NotchMetrics.hoverExpansion + NotchMetrics.dropCatchmentExtraHeight
+        }
         return hovered ? hoverExpandedHeight : layout.baseHeight
     }
 
@@ -81,7 +93,7 @@ struct NotchOverlayView: View {
                             } label: {
                                 ZStack {
                                     Group {
-                                        if hovered {
+                                        if isSwollen {
                                             PanelSilhouetteCanvasFill(
                                                 width: shapeWidth,
                                                 height: shapeHeight + NotchMetrics.expandedPanelTopCornerBleed
@@ -98,7 +110,7 @@ struct NotchOverlayView: View {
                                 }
                                 .frame(
                                     width: shapeWidth,
-                                    height: shapeHeight + (hovered ? NotchMetrics.expandedPanelTopCornerBleed : 0),
+                                    height: shapeHeight + (isSwollen ? NotchMetrics.expandedPanelTopCornerBleed : 0),
                                     alignment: .top
                                 )
                                 .shadow(
