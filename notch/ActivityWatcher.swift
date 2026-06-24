@@ -50,9 +50,12 @@ final class ActivityWatcher: ObservableObject {
     /// haven't yet been deduplicated into the buffer.
     @Published private(set) var latestEvent: Event?
 
-    /// Sample interval. 30s is a sensible default — frequent enough to catch context switches,
+    /// Sample interval. Catches *within-app* changes (new tab, new window title) — actual app
+    /// switches are caught instantly via NSWorkspace's didActivateApplicationNotification, so
+    /// the polling tick can stay relatively coarse without losing switches. 15s is short enough
+    /// for tab/window-title samples on short visits, without burning CPU.
     /// sparse enough that polling cost is negligible.
-    var pollInterval: TimeInterval = 30
+    var pollInterval: TimeInterval = 15
 
     /// Bound on the in-memory event ring. Events older than this get evicted from the head.
     private static let maxEvents = 2000
@@ -76,6 +79,9 @@ final class ActivityWatcher: ObservableObject {
     }
 
     private var timer: Timer?
+    /// NSWorkspace notification observers (app activation, deactivation). Held so we can
+    /// remove them in `stop()` and avoid double-subscription on restart.
+    private var workspaceObservers: [NSObjectProtocol] = []
 
     init() {
         try? FileManager.default.createDirectory(at: storageDirectory, withIntermediateDirectories: true)
@@ -136,11 +142,30 @@ final class ActivityWatcher: ObservableObject {
         }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
+
+        // Subscribe to NSWorkspace app-activation events so we capture EVERY context switch the
+        // moment it happens, not just whatever the periodic tick catches. Without this, any app
+        // visited for less than `pollInterval` seconds disappears from the log entirely.
+        let nc = NSWorkspace.shared.notificationCenter
+        let activated = nc.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                self.captureSnapshot()
+            }
+        }
+        workspaceObservers.append(activated)
     }
 
     func stop() {
         timer?.invalidate()
         timer = nil
+        let nc = NSWorkspace.shared.notificationCenter
+        for obs in workspaceObservers { nc.removeObserver(obs) }
+        workspaceObservers.removeAll()
         isWatching = false
     }
 
