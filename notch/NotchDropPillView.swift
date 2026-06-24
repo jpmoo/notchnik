@@ -63,10 +63,16 @@ struct NotchDropPillView: View {
         for provider in providers {
             guard provider.canLoadObject(ofClass: NSURL.self) else { continue }
             any = true
-            _ = provider.loadObject(ofClass: NSURL.self) { obj, _ in
+            _ = provider.loadObject(ofClass: NSURL.self) { [filePen] obj, _ in
                 guard let url = obj as? URL, url.isFileURL else { return }
-                Task { @MainActor in
-                    filePen.add(url)
+                // Hop to main via DispatchQueue (not Task) and add an extra tick so the drop
+                // completion has fully unwound before we mutate FilePenStore — synchronous file
+                // I/O inside `add` (manifest write + bookmark capture) on the same runloop pass
+                // as the drop delivery has been freezing the drop transition.
+                DispatchQueue.main.async {
+                    DispatchQueue.main.async {
+                        filePen.add(url)
+                    }
                 }
             }
         }

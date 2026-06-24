@@ -207,17 +207,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.dropPillPanel = pillPanel
         positionDropPillPanel(pillPanel)
         pillPanel.orderFrontRegardless()
-
-        // Visibility is driven by the monitor: the panel itself is always present and positioned,
-        // but the SwiftUI body inside renders nothing when no drag is active, so the window is
-        // visually empty and hit-test-inert outside the capsule shape.
-        fileDragMonitor.$isFileDragActive
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
-                guard let self, let pillPanel = self.dropPillPanel else { return }
-                self.positionDropPillPanel(pillPanel)
-            }
-            .store(in: &cancellables)
+        // Visibility is driven entirely by the SwiftUI body inside (opacity / hit-testing on
+        // FileDragMonitor.isFileDragActive). We deliberately do NOT re-position the panel on
+        // every flag flip — calling `setFrame` mid-drop wedges the in-flight drop delivery.
 
         screenObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
