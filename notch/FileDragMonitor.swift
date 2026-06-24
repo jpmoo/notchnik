@@ -24,6 +24,10 @@ final class FileDragMonitor: ObservableObject {
     /// the count is stable, so we only do the (slightly heavier) `types` check when it shifts.
     private var lastDragChangeCount: Int = -1
     private var lastDragHadFiles: Bool = false
+    /// Deferred clear-to-false so the flag doesn't flip the same runloop pass AppKit is
+    /// concluding an in-flight drop — that race was hanging the app on drop. We wait until
+    /// the mouse has been up for a brief grace window before clearing.
+    private var pendingClear: DispatchWorkItem?
 
     init() {
         // 30Hz is plenty for UI feedback — the user perceives drag-start → catchment-grow as
@@ -40,27 +44,48 @@ final class FileDragMonitor: ObservableObject {
     }
 
     private func tick() {
-        // Bit 0 of `pressedMouseButtons` is the left button. If it's not held, there's no drag —
-        // bail before touching the pasteboard at all.
+        // Bit 0 of `pressedMouseButtons` is the left button.
         let leftDown = (NSEvent.pressedMouseButtons & 1) != 0
-        guard leftDown else {
-            if isFileDragActive { isFileDragActive = false }
-            lastDragHadFiles = false
-            lastDragChangeCount = -1
+        if !leftDown {
+            // Mouse just went up (or has been up). Don't flip immediately — AppKit may still
+            // be delivering an in-flight drop, and a synchronous state mutation here causes
+            // SwiftUI body invalidation + animations to interleave with the drop conclusion,
+            // which was hanging the app. Schedule a deferred clear and let any in-flight drop
+            // finish unwinding first.
+            if isFileDragActive, pendingClear == nil {
+                let work = DispatchWorkItem { [weak self] in
+                    MainActor.assumeIsolated {
+                        guard let self else { return }
+                        // Re-check in case the mouse went down again before the timer fired.
+                        let stillUp = (NSEvent.pressedMouseButtons & 1) == 0
+                        if stillUp {
+                            self.isFileDragActive = false
+                        }
+                        self.lastDragHadFiles = false
+                        self.lastDragChangeCount = -1
+                        self.pendingClear = nil
+                    }
+                }
+                pendingClear = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.30, execute: work)
+            }
             return
         }
 
+        // Mouse is down. Cancel any pending clear (the user re-pressed before grace expired).
+        pendingClear?.cancel()
+        pendingClear = nil
+
         // Once we've already detected an active file drag, do NOT keep probing the drag
-        // pasteboard. AppKit briefly locks the drag pasteboard during the drop transition, and
-        // a competing main-thread read at that moment was hanging the app. Active stays active
-        // until the next mouse-up clears it.
+        // pasteboard. AppKit briefly locks it during the drop transition and a competing
+        // main-thread read at that moment hangs the app. Active stays active until the
+        // deferred mouse-up clear runs.
         if isFileDragActive { return }
 
         let pb = NSPasteboard(name: .drag)
         if pb.changeCount != lastDragChangeCount {
             lastDragChangeCount = pb.changeCount
-            // `types` is a cheap header read — no payload load. We only need to know whether a
-            // file-URL representation was registered, not to read the URLs themselves.
+            // `types` is a cheap header read — no payload load.
             lastDragHadFiles = pb.types?.contains(.fileURL) ?? false
         }
 
