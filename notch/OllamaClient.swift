@@ -49,6 +49,19 @@ extension String {
             return String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
         }
 
+        // Leading bracketed metadata like "[2026-06-23 7:24 PM] " or "[system] " — the model
+        // sometimes mimics the timestamp-prefix format we inject into chat history. Drop one
+        // outer `[...]` when it sits at the very start.
+        if trimmed.hasPrefix("[") {
+            if let close = trimmed.firstIndex(of: "]") {
+                let after = trimmed.index(after: close)
+                let rest = String(trimmed[after...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !rest.isEmpty {
+                    return rest
+                }
+            }
+        }
+
         // Triple-backtick fence (with optional language tag): ```lang\nbody\n```
         if trimmed.hasPrefix("```") && trimmed.hasSuffix("```") && trimmed.count > 6 {
             var inner = String(trimmed.dropFirst(3).dropLast(3))
